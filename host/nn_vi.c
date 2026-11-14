@@ -7,6 +7,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include "hos_sdl.h"
+#endif
 
 void hos_system_event_init(uint64_t key, int autoclear);   /* nn_os_sync.c */
 void hos_system_event_signal(uint64_t key);
@@ -102,10 +105,15 @@ static int64_t next_frame_at, window_start, frames_in_window;
 static int display_hz(void) {
     static int hz;
     if (!hz) {
+#ifdef _WIN32
         DEVMODEA dm;
         memset(&dm, 0, sizeof dm);
         dm.dmSize = sizeof dm;
         hz = EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1 ? (int)dm.dmDisplayFrequency : 60;
+#else
+        hz = hos_sdl_desktop_hz();
+        if (hz <= 1) hz = 60;
+#endif
         hz = hz < 60 ? 60 : hz > 240 ? 240 : hz;
     }
     return hz;

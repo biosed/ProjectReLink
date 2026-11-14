@@ -150,22 +150,30 @@ void hos_sdl_relative_mouse(void *window, int on) {
     if (version == 3) CALL(_Bool (*)(void *, _Bool), SetRelativeMouseMode)(window, on != 0);
     else CALL(int (*)(int), SetRelativeMouseMode)(on);
 }
-int hos_sdl_desktop_size(int *width, int *height) {
+static int desktop_mode(int *width, int *height, int *refresh_rate) {
+    if (!version || !f.GetDesktopDisplayMode) return 0;
     if (version == 3) {   /* (SDL_DisplayMode: displayID, format, w and h at 8 and 12 in screen units, pixel_density at
-                             16: in pixels, as SDL2 gave them) */
+                             16: in pixels, as SDL2 gave them; refresh rate at 20) */
         const uint8_t *m = CALL(const uint8_t *(*)(uint32_t), GetDesktopDisplayMode)(CALL(uint32_t (*)(void), GetPrimaryDisplay)());
         if (!m) return 0;
         int w, h;
-        float density;
-        memcpy(&w, m + 8, 4), memcpy(&h, m + 12, 4), memcpy(&density, m + 16, 4);
+        float density, refresh;
+        memcpy(&w, m + 8, 4), memcpy(&h, m + 12, 4), memcpy(&density, m + 16, 4), memcpy(&refresh, m + 20, 4);
         if (!(density > 0)) density = 1;
         *width = (int)(w * density + 0.5f), *height = (int)(h * density + 0.5f);
+        if (refresh_rate) *refresh_rate = refresh > 1 ? (int)(refresh + 0.5f) : 0;
         return 1;
     }
     struct { uint32_t format; int w, h, refresh_rate; void *driverdata; } m;
     if (CALL(int (*)(int, void *), GetDesktopDisplayMode)(0, &m)) return 0;
     *width = m.w, *height = m.h;
+    if (refresh_rate) *refresh_rate = m.refresh_rate;
     return 1;
+}
+int hos_sdl_desktop_size(int *width, int *height) { return desktop_mode(width, height, NULL); }
+int hos_sdl_desktop_hz(void) {
+    int width, height, refresh_rate = 0;
+    return desktop_mode(&width, &height, &refresh_rate) ? refresh_rate : 0;
 }
 int hos_sdl_vulkan_surface(void *window, void *instance, void *surface_out) {
     return version == 3 ? CALL(_Bool (*)(void *, void *, const void *, void *), Vulkan_CreateSurface)(window, instance, NULL, surface_out)

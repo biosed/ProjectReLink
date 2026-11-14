@@ -55,6 +55,11 @@ static int key(int vk) { return !rx_option(1, 0) && hos_key_down(vk); }
    (WASD, Q, E, Z...), and on a French AZERTY one 'W' 'A' 'S' 'D' by label put the left stick on W A S D, a scattered
    cross. A US key's scan code is looked up in the layout of the window in front: Z Q S D on AZERTY, W A S D on QWERTY. */
 static int pos(int us) {
+#ifndef _WIN32
+    /* SDL reports physical scancodes and display_sdl.c maps those to the US
+       virtual-key positions already, independent of the active layout. */
+    return us;
+#else
     static const unsigned char letters[26] = {0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32,
                                               0x31, 0x18, 0x19, 0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C};
     unsigned scan = us >= 'A' && us <= 'Z' ? letters[us - 'A'] : us >= '1' && us <= '9' ? 0x02u + (unsigned)(us - '1')
@@ -73,6 +78,7 @@ static int pos(int us) {
         vk_of[scan] = vk ? (int)vk : us;
     }
     return vk_of[scan];
+#endif
 }
 static int kpos(int us) { return key(pos(us)); }
 
