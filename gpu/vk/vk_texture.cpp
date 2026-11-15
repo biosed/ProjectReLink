@@ -17,6 +17,7 @@
 #include <windows.h>
 #include <psapi.h>
 #if defined(__linux__)
+#include <dlfcn.h>
 #include <malloc.h>
 #endif
 #include <atomic>
@@ -52,6 +53,7 @@
 #include "texture_memory_policy.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
+#include "../../host/sparse_file_ranges.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -1272,6 +1274,19 @@ bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool wid
     if (!p || avail < total) return false;
     const auto t0 = std::chrono::steady_clock::now();
     std::atomic<bool> found{false};
+#if defined(__linux__)
+    // The native Linux guest window is a sparse memfd.  Fresh render targets
+    // can be hundreds of megabytes of holes: they already read as zero, while
+    // the byte scan below would fault every page into shmem merely to prove it.
+    typedef int (*MemfdFn)(void);
+    static const MemfdFn memfd_fn = (MemfdFn)dlsym(RTLD_DEFAULT, "hos_posix_guest_memfd");
+    const int memfd = memfd_fn ? memfd_fn() : -1;
+    const uint64_t guest = host->gpu_guest(tex.gpu);
+    const bool hole = guest && guest < host->guest_size() && total <= host->guest_size() - guest &&
+                      hos_sparse_file_has_data(memfd, guest, guest + total) == 0;
+#else
+    const bool hole = false;
+#endif
     const uint32_t nthreads = std::clamp(std::thread::hardware_concurrency() / 2, 1u, 8u);
     const uint64_t per = ((total / nthreads) + 4095) & ~4095ull;
     auto part = [&](uint32_t t) {
@@ -1289,7 +1304,9 @@ bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool wid
             if (acc) found.store(true, std::memory_order_relaxed);
         }
     };
-    if (nthreads > 1) {
+    if (hole) {
+        // Nothing to read: sparse-file holes are defined to contain zeroes.
+    } else if (nthreads > 1) {
         std::vector<std::thread> th;
         for (uint32_t t = 1; t < nthreads; t++) th.emplace_back(part, t);
         part(0);
@@ -1316,8 +1333,8 @@ bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool wid
         vkCmdClearColorImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
     }
     if (told.fetch_add(1) < 4)
-        logf("vk: upload: %ux%u NVN %#x (%llu MB) is all zero: cleared on the GPU (checked in %.1f ms)", tex.width, tex.height,
-             tex.nvn_format, (unsigned long long)(total >> 20), ms);
+        logf("vk: upload: %ux%u NVN %#x (%llu MB) is all zero: cleared on the GPU (checked in %.1f ms%s)", tex.width, tex.height,
+             tex.nvn_format, (unsigned long long)(total >> 20), ms, hole ? ", sparse hole" : "");
     return true;
 }
 bool upload(Texture& tex, const Ranges* dirty) {

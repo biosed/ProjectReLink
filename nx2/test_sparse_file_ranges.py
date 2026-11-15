@@ -35,8 +35,13 @@ int main(void) {
     CHECK(fd >= 0 && ftruncate(fd, (off_t)size) == 0);
     uint8_t *map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     CHECK(map != MAP_FAILED);
+    CHECK(hos_sparse_file_has_data(fd, 0, size) == 0);
     map[17] = 0xa5;
     map[2 * page + 29] = 0x5a;
+    CHECK(hos_sparse_file_has_data(fd, 0, page) == 1);
+    CHECK(hos_sparse_file_has_data(fd, page, 2 * page) == 0);
+    CHECK(hos_sparse_file_has_data(fd, 2 * page, 3 * page) == 1);
+    CHECK(hos_sparse_file_has_data(-1, 0, page) == -1);
     CHECK(lseek(fd, (off_t)page, SEEK_DATA) == (off_t)(2 * page));
     CHECK(hos_sparse_file_zero_data(fd, map, 0, 3 * page) == 0);
     CHECK(map[17] == 0 && map[2 * page + 29] == 0);
