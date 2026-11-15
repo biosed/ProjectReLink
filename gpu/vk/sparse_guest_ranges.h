@@ -19,6 +19,39 @@ inline void set_bound(std::vector<uint64_t>& words, uint64_t first, uint64_t cou
         words[block / 64] |= 1ull << (block & 63);
 }
 
+inline void clear_bound(std::vector<uint64_t>& words, uint64_t first, uint64_t count) {
+    for (uint64_t block = first; block < first + count; block++)
+        if (block / 64 < words.size()) words[block / 64] &= ~(1ull << (block & 63));
+}
+
+/// Whether any byte backed by these runs touches [lo, hi). `resource_lo` is the guest address represented by offset 0.
+inline bool touches(const std::vector<Run>& runs, uint64_t resource_lo, uint64_t lo, uint64_t hi) {
+    if (hi <= lo) return false;
+    for (const Run& r : runs) {
+        if (r.offset > UINT64_MAX - resource_lo) return true;
+        const uint64_t a = resource_lo + r.offset;
+        const uint64_t b = r.size > UINT64_MAX - a ? UINT64_MAX : a + r.size;
+        if (a < hi && b > lo) return true;
+    }
+    return false;
+}
+
+/// Whether every byte backed by these runs is outside the sorted live ranges. A sparse allocation may pack several
+/// disjoint runs into one VkDeviceMemory, so it can be freed only when none of them is live.
+template <class Ranges>
+inline bool all_outside(const std::vector<Run>& runs, uint64_t resource_lo, const Ranges& live) {
+    for (const Run& r : runs) {
+        if (r.offset > UINT64_MAX - resource_lo) return false;
+        const uint64_t a = resource_lo + r.offset;
+        const uint64_t b = r.size > UINT64_MAX - a ? UINT64_MAX : a + r.size;
+        for (const auto& span : live) {
+            if (span.lo >= b) break;
+            if (span.lo < b && span.hi > a) return false;
+        }
+    }
+    return true;
+}
+
 /// Whether [lo, hi) touches a block already bound to the sparse resource. The range may extend past the resource;
 /// callers use this when deciding whether freed guest pages are still visible to the GPU.
 inline bool overlaps_bound(const std::vector<uint64_t>& words, uint64_t resource_lo, uint64_t block_size,

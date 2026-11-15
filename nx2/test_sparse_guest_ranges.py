@@ -26,6 +26,7 @@ def main():
 
 int main() {
     constexpr uint64_t base = 0x1000000000ull, block = 65536;
+    struct Live { uint64_t lo, hi; };
     std::vector<uint8_t> wanted(8);
     std::vector<uint64_t> bound(1);
 
@@ -51,6 +52,9 @@ int main() {
     CHECK(sparse_guest::overlaps_bound(bound, base, block, base + 2 * block, base + 3 * block + 1));
     CHECK(!sparse_guest::overlaps_bound(bound, base, block, base - block, base));
     CHECK(!sparse_guest::overlaps_bound(bound, base, 0, base, base + 1));
+    sparse_guest::clear_bound(bound, 3, 1);
+    CHECK(!sparse_guest::bound(bound, 3) && sparse_guest::bound(bound, 0));
+    sparse_guest::clear_bound(bound, 99, 1);
 
     std::fill(wanted.begin(), wanted.end(), 0);
     sparse_guest::mark(wanted, base, block, base + 7 * block + 1, base + 8 * block);
@@ -59,7 +63,19 @@ int main() {
     sparse_guest::mark(wanted, base, block, base, base);
     sparse_guest::mark(wanted, base, 0, base, base + 1);
 
-    std::puts("PASS: sparse guest ranges round, merge, exclude, and find bound blocks");
+    const std::vector<sparse_guest::Run> allocation{{block, block}, {4 * block, 2 * block}};
+    CHECK(sparse_guest::touches(allocation, base, base + block, base + 2 * block));
+    CHECK(sparse_guest::touches(allocation, base, base + 5 * block, base + 7 * block));
+    CHECK(!sparse_guest::touches(allocation, base, base + 2 * block, base + 4 * block));
+    CHECK(!sparse_guest::touches(allocation, base, base, base));
+    CHECK(sparse_guest::all_outside(allocation, base, std::vector<Live>{{base, base + block}}));
+    CHECK(!sparse_guest::all_outside(allocation, base, std::vector<Live>{{base + 5 * block, base + 7 * block}}));
+    CHECK(!sparse_guest::all_outside(allocation, base,
+                                     std::vector<Live>{{base, base + block}, {base + block, base + 2 * block}}));
+    CHECK(sparse_guest::all_outside(allocation, base,
+                                    std::vector<Live>{{base, base + block}, {base + 2 * block, base + 4 * block}}));
+
+    std::puts("PASS: sparse guest ranges round, merge, release, and exclude live blocks");
 }
 '''
     work = ROOT / "work"

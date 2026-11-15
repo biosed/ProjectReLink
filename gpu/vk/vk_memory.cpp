@@ -47,6 +47,14 @@
 namespace mkwvk {
 namespace {
 
+#ifdef __linux__
+struct SparseGuestAllocation {
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::vector<sparse_guest::Run> runs;
+    bool keep = false;   // the one-block primary allocation keeps Pool::memory valid for the pool's lifetime
+};
+#endif
+
 struct Pool {
     uint64_t lo = 0, hi = 0;   // guest range imported (aligned outwards)
     uint64_t range_lo = 0, range_hi = 0;   // (the game's pool range it was found for: pool_of's last hit)
@@ -58,6 +66,7 @@ struct Pool {
     bool sparse_guest = false;   // (RX_VK_SPARSE_GUEST: untouched guest blocks stay unbound and read as zero)
     uint64_t sparse_align = 0, sparse_size = 0;
     std::vector<uint64_t> sparse_bound;   // (one bit per sparse block already backed by the guest memfd)
+    std::vector<SparseGuestAllocation> sparse_allocations;   // the exact runs owned by each imported dma-buf
 #endif
     // its VRAM mirror (see "the VRAM mirror" below)
     enum : uint8_t { MIRROR_NONE, MIRROR_WANTED, MIRROR_ON, MIRROR_REFUSED } mstate = MIRROR_NONE;
@@ -255,12 +264,11 @@ VkDeviceMemory dma_buf_memory(uint64_t lo, uint64_t size) {
     return dma_buf_fd_memory(fd, size, lo);
 }
 
-VkResult bind_sparse_buffer(VkBuffer buffer, const std::vector<VkSparseMemoryBind>& binds) {
-    if (binds.empty()) return VK_SUCCESS;
-    VkSparseBufferMemoryBindInfo bb{buffer, (uint32_t)binds.size(), binds.data()};
+VkResult bind_sparse_buffers(const std::vector<VkSparseBufferMemoryBindInfo>& buffers, bool drain_before) {
+    if (buffers.empty()) return VK_SUCCESS;
     VkBindSparseInfo si{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
-    si.bufferBindCount = 1;
-    si.pBufferBinds = &bb;
+    si.bufferBindCount = (uint32_t)buffers.size();
+    si.pBufferBinds = buffers.data();
     static VkFence fence = VK_NULL_HANDLE;   // (the background importer and the recording thread can both import)
     static std::mutex fence_mu;
     std::lock_guard fk(fence_mu);
@@ -270,16 +278,82 @@ VkResult bind_sparse_buffer(VkBuffer buffer, const std::vector<VkSparseMemoryBin
         if (r != VK_SUCCESS) return r;
     }
     VkResult res;
-    {   // (nothing uses a newly bound range until this returns; held batched submissions must leave first)
+    {   // Sparse binds are not implicitly ordered against command-buffer execution, even on one queue. A mapping change on
+        // a published buffer drains earlier access; a brand-new buffer has none. The fence completes either change before
+        // any later submit can use it.
         std::lock_guard qk(dev.present_mu);
         queue_flush_locked();
-        res = vkQueueBindSparse(dev.queue, 1, &si, fence);
+        res = drain_before ? vkQueueWaitIdle(dev.queue) : VK_SUCCESS;
+        if (res == VK_SUCCESS) res = vkQueueBindSparse(dev.queue, 1, &si, fence);
     }
     if (res == VK_SUCCESS) {
         res = vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
         vkResetFences(dev.device, 1, &fence);
     }
     return res;
+}
+
+VkResult bind_sparse_buffer(VkBuffer buffer, const std::vector<VkSparseMemoryBind>& binds, bool drain_before = false) {
+    if (binds.empty()) return VK_SUCCESS;
+    const std::vector<VkSparseBufferMemoryBindInfo> buffers{{buffer, (uint32_t)binds.size(), binds.data()}};
+    return bind_sparse_buffers(buffers, drain_before);
+}
+
+/// Import and bind one allocation's runs. The primary allocation is deliberately one block: Pool::memory remains valid
+/// even when every other allocation is released, while at most one sparse block stays pinned for that bookkeeping rule.
+bool sparse_guest_bind_runs(Pool& p, const std::vector<sparse_guest::Run>& runs, bool keep, bool drain_before) {
+    if (runs.empty()) return true;
+    uint64_t packed_size = 0;
+    for (const sparse_guest::Run& r : runs) packed_size += r.size;
+    if (!packed_size || packed_size > dmabuf_limit || runs.size() > dmabuf_list_limit || runs.size() > UINT32_MAX) {
+        if (dmabuf_failures++ < 8)
+            logf("vk: pool %#llx: %llu MB of sparse guest blocks exceed one udmabuf list", (unsigned long long)p.lo,
+                 (unsigned long long)(packed_size >> 20));
+        return false;
+    }
+    std::vector<uint8_t> storage(sizeof(UdmabufCreateList) + runs.size() * sizeof(UdmabufCreateItem));
+    auto* create = reinterpret_cast<UdmabufCreateList*>(storage.data());
+    auto* items = reinterpret_cast<UdmabufCreateItem*>(storage.data() + sizeof(UdmabufCreateList));
+    create->flags = 1 /* UDMABUF_FLAGS_CLOEXEC */;
+    create->count = (uint32_t)runs.size();
+    for (size_t i = 0; i < runs.size(); i++)
+        items[i] = {(uint32_t)dmabuf_memfd, 0, p.lo + runs[i].offset, runs[i].size};
+    const int fd = ioctl(dmabuf_dev, kUdmabufCreateList, create);
+    if (fd < 0) {
+        if (dmabuf_failures++ < 8)
+            logf("vk: pool %#llx: UDMABUF_CREATE_LIST refused %zu extents (errno %d)", (unsigned long long)p.lo,
+                 runs.size(), errno);
+        return false;
+    }
+    const VkDeviceMemory memory = dma_buf_fd_memory(fd, packed_size, p.lo);
+    if (!memory) return false;
+    std::vector<VkSparseMemoryBind> binds;
+    uint64_t memory_offset = 0;
+    for (const sparse_guest::Run& r : runs) {
+        binds.push_back({r.offset, r.size, memory, memory_offset, 0});
+        memory_offset += r.size;
+    }
+    const VkResult res = bind_sparse_buffer(p.buffer, binds, drain_before);
+    if (res != VK_SUCCESS) {
+        vkFreeMemory(dev.device, memory, nullptr);
+        if (dmabuf_failures++ < 8)
+            logf("vk: pool %#llx: %zu sparse guest extents not bound (VkResult %d)", (unsigned long long)p.lo,
+                 runs.size(), (int)res);
+        return false;
+    }
+    if (keep) p.memory = memory;
+    else p.pieces.push_back(memory);
+    p.sparse_allocations.push_back({memory, runs, keep});
+    for (const sparse_guest::Run& r : runs)
+        sparse_guest::set_bound(p.sparse_bound, r.offset / p.sparse_align, r.size / p.sparse_align);
+    static uint64_t bound_bytes;
+    static int64_t bound_calls;
+    bound_bytes += packed_size, bound_calls++;
+    if (bound_calls <= 8 || bound_calls % 64 == 0)
+        logf("vk: sparse guest pool %#llx: bound %zu runs / %llu KB (%lld binds, %llu MB in all)",
+             (unsigned long long)p.lo, runs.size(), (unsigned long long)(packed_size >> 10), (long long)bound_calls,
+             (unsigned long long)(bound_bytes >> 20));
+    return true;
 }
 
 /// Back the data blocks in [guest_lo, guest_hi), or every block there when `force` is true. The latter is used before
@@ -320,61 +394,78 @@ bool sparse_guest_bind(Pool& p, uint64_t guest_lo, uint64_t guest_hi, bool force
     }
     bool any = false;
     for (uint8_t x : wanted) any |= x != 0;
-    if (ensure_one && !any && blocks) wanted[0] = 1, any = true;
+    // The generic Pool lifecycle owns its primary allocation through p.memory. Always include block zero in the first
+    // sparse import, even when other populated blocks were found, so the split below can establish that invariant.
+    if (ensure_one && blocks) wanted[0] = 1, any = true;
     if (!any) return true;
-    const std::vector<sparse_guest::Run> runs = sparse_guest::runs(wanted, p.sparse_bound, p.sparse_align);
+    std::vector<sparse_guest::Run> runs = sparse_guest::runs(wanted, p.sparse_bound, p.sparse_align);
     if (runs.empty()) return true;
-    uint64_t packed_size = 0;
-    for (const sparse_guest::Run& r : runs) packed_size += r.size;
-    if (!packed_size || packed_size > dmabuf_limit || runs.size() > dmabuf_list_limit || runs.size() > UINT32_MAX) {
-        if (dmabuf_failures++ < 8)
-            logf("vk: pool %#llx: %llu MB of sparse guest blocks exceed one udmabuf list", (unsigned long long)p.lo,
-                 (unsigned long long)(packed_size >> 20));
-        return false;
+    if (!p.memory && ensure_one) {
+        // wanted[0] made the first run start at zero. Split one block out so later releases never have to keep a large,
+        // mixed allocation merely because Pool::memory is the primary handle used by the generic cleanup paths.
+        const sparse_guest::Run primary{0, p.sparse_align};
+        if (runs.front().offset != 0 || runs.front().size < p.sparse_align ||
+            !sparse_guest_bind_runs(p, {primary}, true, false))
+            return false;
+        runs.front().offset += p.sparse_align;
+        runs.front().size -= p.sparse_align;
+        if (!runs.front().size) runs.erase(runs.begin());
+        return sparse_guest_bind_runs(p, runs, false, false);
     }
-    std::vector<uint8_t> storage(sizeof(UdmabufCreateList) + runs.size() * sizeof(UdmabufCreateItem));
-    auto* create = reinterpret_cast<UdmabufCreateList*>(storage.data());
-    auto* items = reinterpret_cast<UdmabufCreateItem*>(storage.data() + sizeof(UdmabufCreateList));
-    create->flags = 1 /* UDMABUF_FLAGS_CLOEXEC */;
-    create->count = (uint32_t)runs.size();
-    for (size_t i = 0; i < runs.size(); i++) {
-        items[i] = {(uint32_t)dmabuf_memfd, 0, p.lo + runs[i].offset, runs[i].size};
-    }
-    const int fd = ioctl(dmabuf_dev, kUdmabufCreateList, create);
-    if (fd < 0) {
-        if (dmabuf_failures++ < 8)
-            logf("vk: pool %#llx: UDMABUF_CREATE_LIST refused %zu extents (errno %d)", (unsigned long long)p.lo,
-                 runs.size(), errno);
-        return false;
-    }
-    const VkDeviceMemory memory = dma_buf_fd_memory(fd, packed_size, p.lo);
-    if (!memory) return false;
+    return sparse_guest_bind_runs(p, runs, false, true);
+}
+
+struct SparseGuestRelease {
+    Pool* pool = nullptr;
+    std::vector<size_t> allocations;
     std::vector<VkSparseMemoryBind> binds;
-    uint64_t memory_offset = 0;
-    for (const sparse_guest::Run& r : runs) {
-        binds.push_back({r.offset, r.size, memory, memory_offset, 0});
-        memory_offset += r.size;
+};
+
+/// Plan whole imported allocations touched by any released range once none of their packed runs belongs to a current
+/// game pool. Vulkan names one VkDeviceMemory for all of an allocation's runs, so freeing only part would leave the same
+/// dma-buf (and all its pinned pages) alive. The one-block primary allocation is kept until Pool teardown.
+void sparse_guest_release_plan(Pool& p, const std::vector<std::pair<uint64_t, uint64_t>>& released,
+                               SparseGuestRelease& plan) {
+    if (!p.sparse_guest || !p.sparse_align) return;
+    plan.pool = &p;
+    for (size_t i = 0; i < p.sparse_allocations.size(); i++) {
+        const SparseGuestAllocation& a = p.sparse_allocations[i];
+        bool touched = false;
+        for (const auto& [lo, hi] : released)
+            if (sparse_guest::touches(a.runs, p.lo, lo, hi)) {
+                touched = true;
+                break;
+            }
+        if (a.keep || !touched || !sparse_guest::all_outside(a.runs, p.lo, guest_pools)) continue;
+        plan.allocations.push_back(i);
+        for (const sparse_guest::Run& r : a.runs)
+            plan.binds.push_back({r.offset, r.size, VK_NULL_HANDLE, 0, 0});
     }
-    const VkResult res = bind_sparse_buffer(p.buffer, binds);
-    if (res != VK_SUCCESS) {
-        vkFreeMemory(dev.device, memory, nullptr);
-        if (dmabuf_failures++ < 8)
-            logf("vk: pool %#llx: %zu sparse guest extents not bound (VkResult %d)", (unsigned long long)p.lo,
-                 runs.size(), (int)res);
-        return false;
+}
+
+void sparse_guest_release_finish(SparseGuestRelease& plan, std::vector<std::pair<uint64_t, uint64_t>>& freed) {
+    Pool& p = *plan.pool;
+    uint64_t bytes = 0;
+    const size_t allocations = plan.allocations.size();
+    for (auto at = plan.allocations.rbegin(); at != plan.allocations.rend(); ++at) {
+        SparseGuestAllocation a = std::move(p.sparse_allocations[*at]);
+        for (const sparse_guest::Run& r : a.runs) {
+            sparse_guest::clear_bound(p.sparse_bound, r.offset / p.sparse_align, r.size / p.sparse_align);
+            const uint64_t lo = p.lo + r.offset;
+            freed.push_back({lo, lo + r.size});
+            bytes += r.size;
+        }
+        const auto piece = std::find(p.pieces.begin(), p.pieces.end(), a.memory);
+        if (piece != p.pieces.end()) p.pieces.erase(piece);
+        vkFreeMemory(dev.device, a.memory, nullptr);
+        p.sparse_allocations.erase(p.sparse_allocations.begin() + (ptrdiff_t)*at);
     }
-    if (!p.memory) p.memory = memory;
-    else p.pieces.push_back(memory);
-    for (const sparse_guest::Run& r : runs)
-        sparse_guest::set_bound(p.sparse_bound, r.offset / p.sparse_align, r.size / p.sparse_align);
-    static uint64_t bound_bytes;
-    static int64_t bound_calls;
-    bound_bytes += packed_size, bound_calls++;
-    if (bound_calls <= 8 || bound_calls % 64 == 0)
-        logf("vk: sparse guest pool %#llx: bound %zu runs / %llu KB (%lld binds, %llu MB in all)",
-             (unsigned long long)p.lo, runs.size(), (unsigned long long)(packed_size >> 10), (long long)bound_calls,
-             (unsigned long long)(bound_bytes >> 20));
-    return true;
+    static uint64_t released_bytes;
+    static int64_t released_allocations;
+    released_bytes += bytes, released_allocations += (int64_t)allocations;
+    logf("vk: sparse guest pool %#llx: released %zu allocations / %llu KB (%lld allocations, %llu MB in all)",
+         (unsigned long long)p.lo, allocations, (unsigned long long)(bytes >> 10), (long long)released_allocations,
+         (unsigned long long)(released_bytes >> 20));
 }
 
 bool import_sparse_guest(uint64_t lo, uint64_t hi, Pool& p) {
@@ -418,7 +509,8 @@ bool import_sparse_guest(uint64_t lo, uint64_t hi, Pool& p) {
 }
 
 /// Newly allocated memfd extents can appear after a pool was imported. A single fstat normally makes this free; only a
-/// changed block count scans the live sparse pools. Explicit buffer bindings below also refresh their exact range.
+/// changed block count scans the parts of sparse imports that current game pools cover. Scanning an import's whole range
+/// would immediately rebind CPU pages after the game released their old pool. Explicit bindings refresh their exact range.
 void sparse_guest_refresh_all() {
     if (dmabuf_memfd < 0) return;
     struct stat st{};
@@ -427,7 +519,12 @@ void sparse_guest_refresh_all() {
     bool ok = true;
     for (auto& kv : imported) {
         Pool& p = kv.second;
-        if (p.sparse_guest && !sparse_guest_bind(p, p.lo, p.lo + p.sparse_size, false, false)) ok = false;
+        if (!p.sparse_guest) continue;
+        for (const GuestPool& g : guest_pools) {
+            if (g.lo >= p.lo + p.sparse_size) break;
+            if (g.hi <= p.lo) continue;
+            if (!sparse_guest_bind(p, std::max(p.lo, g.lo), std::min(p.lo + p.sparse_size, g.hi), false, false)) ok = false;
+        }
     }
     dmabuf_seen_blocks.store(ok ? st.st_blocks : -1, std::memory_order_relaxed);
 }
@@ -783,6 +880,11 @@ void memory_sync() {
     std::sort(next.begin(), next.end(), [](const GuestPool& a, const GuestPool& b) { return a.lo < b.lo; });
     std::lock_guard lk(pools_mu);
     guest_pools.swap(next);
+#ifdef __linux__
+    // The memfd's block count need not change when a game pool begins covering already-allocated pages. Make the next
+    // submission refresh the new live intersections even when fstat alone would otherwise skip the scan.
+    dmabuf_seen_blocks.store(-1, std::memory_order_relaxed);
+#endif
     guest_pools_gen.fetch_add(1, std::memory_order_relaxed);
     last_pool = nullptr;
     std::fill(std::begin(pool_cache), std::end(pool_cache), nullptr);
@@ -3922,7 +4024,46 @@ void released_drain() {   // (pools_mu held)
         take.assign(released_queue.begin(), released_queue.begin() + n);
         released_queue.erase(released_queue.begin(), released_queue.begin() + n);
     }
-    for (const auto& [lo, hi] : take) release_uncovered(lo, hi);
+    std::vector<std::pair<uint64_t, uint64_t>> gaps = take;
+#ifdef __linux__
+    // Unbind every affected buffer in one sparse submission. release_uncovered then sees the cleared bound bits and can
+    // let the host punch those pages out. An allocation can contain runs from earlier releases too, so add all its runs.
+    std::vector<SparseGuestRelease> plans;
+    for (auto& kv : imported) {
+        Pool& p = kv.second;
+        bool overlaps = false;
+        for (const auto& [lo, hi] : take)
+            if (p.lo < hi && p.hi > lo) {
+                overlaps = true;
+                break;
+            }
+        if (!overlaps) continue;
+        SparseGuestRelease plan;
+        sparse_guest_release_plan(p, take, plan);
+        if (!plan.allocations.empty()) plans.push_back(std::move(plan));
+    }
+    if (!plans.empty()) {
+        std::vector<VkSparseBufferMemoryBindInfo> buffers;
+        size_t extents = 0;
+        for (const SparseGuestRelease& plan : plans) {
+            buffers.push_back({plan.pool->buffer, (uint32_t)plan.binds.size(), plan.binds.data()});
+            extents += plan.binds.size();
+        }
+        const VkResult res = bind_sparse_buffers(buffers, true);
+        if (res == VK_SUCCESS) {
+            for (SparseGuestRelease& plan : plans) sparse_guest_release_finish(plan, gaps);
+        } else if (dmabuf_failures++ < 8) {
+            logf("vk: %zu sparse guest extents in %zu pools not released (VkResult %d)", extents, plans.size(), (int)res);
+        }
+    }
+#endif
+    std::sort(gaps.begin(), gaps.end());
+    std::vector<std::pair<uint64_t, uint64_t>> merged;
+    for (const auto& gap : gaps) {
+        if (!merged.empty() && gap.first <= merged.back().second) merged.back().second = std::max(merged.back().second, gap.second);
+        else merged.push_back(gap);
+    }
+    for (const auto& [lo, hi] : merged) release_uncovered(lo, hi);
 }
 
 void imports_give_back() {   // (pools_mu held)
