@@ -535,10 +535,19 @@ static void dec_unregister(Ctx *c) {
     RET(0);
 }
 /* AcquireXDecoderOutputBuffer(u32* index, NativeSyncHandle*, decoder): the oldest picture into a free buffer */
+static void dec_acquire_return(Ctx *c, int away, uint64_t result) {
+    if (away) hos_vcore_back();
+    RET(result);
+}
 static void dec_acquire(Ctx *c) {
+    /* The console's decoder is separate hardware.  Here libavcodec/dav1d does
+       that work synchronously (including its own worker threads), so the
+       calling guest thread must not keep a virtual CPU core while it waits for
+       a frame and copies the decoded picture. */
+    const int away = hos_vcore_away();
     Dec *d = (Dec *)host_of(ARG(2), DEC_MAGIC);
     if (ARG(1)) G64(ARG(1)) = 0;
-    if (!d) { RET(RESULT_NO_OUTPUT); return; }
+    if (!d) { dec_acquire_return(c, away, RESULT_NO_OUTPUT); return; }
     /* (the library aborts on any failure here: the hardware call waits for a picture. Up to ~100 ms for one decoded
        by another thread's submission; then a free buffer as it was, so the caller is never refused) */
     AcquireSRWLockExclusive(&d->lock);
@@ -554,7 +563,7 @@ static void dec_acquire(Ctx *c) {
         if (d->slots[i] && !d->busy[i] && host_of(d->slots[i], POOL_MAGIC)) slot = i;
     if (slot < 0) {
         ReleaseSRWLockExclusive(&d->lock);
-        RET(RESULT_NO_OUTPUT);
+        dec_acquire_return(c, away, RESULT_NO_OUTPUT);
         return;
     }
     d->acquires++;
@@ -570,7 +579,7 @@ static void dec_acquire(Ctx *c) {
             hos_log("video: the first buffer went out before the first picture was decoded (shown black)");
         ReleaseSRWLockExclusive(&d->lock);
         if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
-        RET(0);
+        dec_acquire_return(c, away, 0);
         return;
     }
     {   /* (relink) The game takes one picture a frame, and the sound plays on: under 60 fps the movie fell behind its
@@ -651,7 +660,7 @@ static void dec_acquire(Ctx *c) {
     d->qhead = (d->qhead + 1) % MAX_QUEUE, d->qn--;
     ReleaseSRWLockExclusive(&d->lock);
     if (ARG(0)) G32(ARG(0)) = (uint32_t)slot;
-    RET(0);
+    dec_acquire_return(c, away, 0);
 }
 /* ReleaseXDecoderOutputBuffer(decoder, u32 index, NativeSyncHandle) */
 static void dec_release(Ctx *c) {
