@@ -1,6 +1,7 @@
 /* Guest memory map: the system region (our own objects), the heap, address regions.
    The whole 4 GB window is committed up front (hos_main.c), so "mapping" here is only bookkeeping and zeroing. */
 #include "hos.h"
+#include "region_gaps.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,7 @@ uint64_t hos_heap_size, hos_heap_used, hos_total_memory, hos_program_size;
 static uint64_t sys_next = HOS_SYSTEM_BASE;
 
 /* Address regions are handed out top-down from HOS_SPACE_END; the heap grows up from HOS_HEAP_BASE. */
-typedef struct { uint64_t addr, size; } Range;
+typedef HosRegionGap Range;
 static Range *regions;
 static int nregions, capregions;
 static uint64_t region_floor = ~0ULL;   /* the lowest region (none yet: the window's end) */
@@ -170,6 +171,19 @@ static void discard_pages(uint64_t addr, uint64_t size) {
 #endif
 }
 
+#if !defined(__EMSCRIPTEN__)
+static uint64_t release_region_gap(uint64_t lo, uint64_t hi, void *opaque) {
+    (void)opaque;
+    if (hi <= lo) return 0;
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    return VirtualFree(GP(lo), (SIZE_T)(hi - lo), MEM_DECOMMIT) ? hi - lo : 0;
+#else
+    extern int hos_posix_guest_discard(void *p, size_t n);   /* (hos_main.c: MADV_REMOVE on the memfd window) */
+    return hos_posix_guest_discard(GP(lo), (size_t)(hi - lo)) == 0 ? hi - lo : 0;
+#endif
+}
+#endif
+
 /* (relink, night 10/11) The parts of [lo, hi) that no region holds now, in the address regions' part of the window,
    decommitted: what the game mapped in regions it has freed since. The game frees a region without unmapping its pages first
    (20.9 GB mapped and 52 MB unmapped over six areas, hs493), and a freed region's pages were only discarded: the regions'
@@ -178,25 +192,14 @@ static void discard_pages(uint64_t addr, uint64_t size) {
    made meanwhile; a region made since is not a gap, so a range freed and handed out again keeps its pages. Returns the bytes
    given back */
 uint64_t hos_region_release_gaps(uint64_t lo, uint64_t hi) {
-#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#if !defined(__EMSCRIPTEN__)
     uint64_t done = 0;
     LOCK();
     const uint64_t floor = region_floor < HOS_SPACE_END ? region_floor : HOS_SPACE_END;
     if (lo < floor) lo = floor;
     if (hi > HOS_SPACE_END) hi = HOS_SPACE_END;
     lo = (lo + 0xFFF) & ~0xFFFULL, hi &= ~0xFFFULL;
-    /* (the regions are sorted by address, descending: the gaps of [lo, hi) from its top down) */
-    uint64_t top = hi;
-    for (int i = 0; i < nregions && top > lo; i++) {
-        const uint64_t a = regions[i].addr, b = (a + regions[i].size + 0xFFF) & ~0xFFFULL;
-        if (a >= top) continue;   /* (above what is left of the range) */
-        if (b < top) {
-            const uint64_t g = b > lo ? b : lo;
-            if (top > g && VirtualFree(GP(g), (SIZE_T)(top - g), MEM_DECOMMIT)) done += top - g;
-        }
-        top = a & ~0xFFFULL;
-    }
-    if (top > lo && VirtualFree(GP(lo), (SIZE_T)(top - lo), MEM_DECOMMIT)) done += top - lo;
+    done = hos_region_gaps_release(regions, (size_t)nregions, lo, hi, release_region_gap, NULL);
     UNLOCK();
     return done;
 #else
