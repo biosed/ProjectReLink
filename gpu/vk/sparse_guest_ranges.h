@@ -11,6 +11,18 @@ struct Run {
     uint64_t offset = 0, size = 0;
 };
 
+/// Number of bytes actually backed by a packed sparse allocation.  This is
+/// deliberately not the sparse resource's virtual span: holes have no dma-buf
+/// pages and must not be credited as freed under memory pressure.
+inline uint64_t bytes(const std::vector<Run>& runs) {
+    uint64_t result = 0;
+    for (const Run& r : runs) {
+        if (r.size > UINT64_MAX - result) return UINT64_MAX;
+        result += r.size;
+    }
+    return result;
+}
+
 inline bool bound(const std::vector<uint64_t>& words, uint64_t block) {
     return block / 64 < words.size() && (words[block / 64] >> (block & 63) & 1);
 }

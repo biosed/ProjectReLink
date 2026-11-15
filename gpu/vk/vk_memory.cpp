@@ -103,6 +103,21 @@ struct Pool {
     std::vector<uint32_t> wb_flush_words; // (the words of wb_flushing that are not zero)
     uint32_t wb_pending_n = 0;
 };
+
+uint64_t pool_imported_bytes(const Pool& p) {
+#ifdef __linux__
+    if (p.sparse_guest) {
+        uint64_t bytes = 0;
+        for (const SparseGuestAllocation& allocation : p.sparse_allocations) {
+            const uint64_t allocation_bytes = sparse_guest::bytes(allocation.runs);
+            if (allocation_bytes > UINT64_MAX - bytes) return UINT64_MAX;
+            bytes += allocation_bytes;
+        }
+        return bytes;
+    }
+#endif
+    return p.hi - p.lo;
+}
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
 struct GuestPool {
@@ -4146,7 +4161,7 @@ void imports_give_back() {   // (pools_mu held)
                 Pool& p = it->second;
                 guest_pages_set(p.lo, p.hi, 0);
                 p.retired_value = mem_rec_value;   // (freed once this submission's recording is done on the GPU)
-                bytes += p.hi - p.lo;
+                bytes += pool_imported_bytes(p);
                 evicted_pools.push_back(imported.extract(it));
             }
             pools_gen++;
@@ -4189,7 +4204,7 @@ void imports_give_back() {   // (pools_mu held)
         Pool& p = it->second;
         guest_pages_set(p.lo, p.hi, 0);
         p.retired_value = mem_rec_value;   // (this submission's recording is being made: freed once it is done)
-        freed += p.hi - p.lo;
+        freed += pool_imported_bytes(p);
         n++;
         evicted_pools.push_back(imported.extract(it));
     }

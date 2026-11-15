@@ -1,4 +1,4 @@
-"""Test sparse guest-memory block rounding, merging, and already-bound filtering.
+"""Test sparse guest-memory block rounding, merging, accounting, and already-bound filtering.
 
 No Vulkan device, game data, or Linux udmabuf device is used.
 
@@ -64,6 +64,8 @@ int main() {
     sparse_guest::mark(wanted, base, 0, base, base + 1);
 
     const std::vector<sparse_guest::Run> allocation{{block, block}, {4 * block, 2 * block}};
+    CHECK(sparse_guest::bytes(allocation) == 3 * block);
+    CHECK(sparse_guest::bytes({{0, UINT64_MAX}, {0, 1}}) == UINT64_MAX);
     CHECK(sparse_guest::touches(allocation, base, base + block, base + 2 * block));
     CHECK(sparse_guest::touches(allocation, base, base + 5 * block, base + 7 * block));
     CHECK(!sparse_guest::touches(allocation, base, base + 2 * block, base + 4 * block));
@@ -87,7 +89,7 @@ int main() {
     CHECK(sparse_guest::batches({{0, block}}, block - 1, 2, block).empty());
     CHECK(sparse_guest::batches({{UINT64_MAX - block + 1, block}}, 64 * block, 2, block).empty());
 
-    std::puts("PASS: sparse guest ranges round, merge, release, and exclude live blocks");
+    std::puts("PASS: sparse guest ranges round, merge, account, release, and exclude live blocks");
 }
 '''
     work = ROOT / "work"
