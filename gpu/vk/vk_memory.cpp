@@ -577,7 +577,13 @@ bool import_sparse_guest(uint64_t lo, uint64_t hi, Pool& p) {
     }
     p.lo = lo, p.hi = hi, p.buffer = buffer, p.sparse_guest = true, p.sparse_align = block, p.sparse_size = req.size;
     p.sparse_bound.assign((size_t)((req.size / block + 63) / 64), 0);
-    if (!sparse_guest_bind(p, lo, lo + req.size, false, true)) {
+    // Establish only the primary allocation here.  The imported buffer is a
+    // chunk around the resource that caused the lookup, and scanning that
+    // whole chunk made a small texture upload pay SEEK_DATA over tens of MB
+    // (and occasionally seconds under shmem pressure).  gpu_buffer[_bind]
+    // binds the exact range before returning it to a Vulkan consumer; imports
+    // made ahead need no other blocks until their first binding.
+    if (!sparse_guest_bind(p, lo, lo, false, true)) {
         vkDestroyBuffer(dev.device, buffer, nullptr);
         if (p.memory) vkFreeMemory(dev.device, p.memory, nullptr);
         for (VkDeviceMemory m : p.pieces) vkFreeMemory(dev.device, m, nullptr);
@@ -3618,6 +3624,12 @@ BufferRef gpu_buffer(uint64_t gpu, uint64_t size) {
     std::lock_guard lk(pools_mu);
     Pool* p = pool_of(guest, size);
     if (!p) return {};
+#ifdef __linux__
+    // A sparse import starts with only its primary block.  Bind the exact
+    // direct-source span here instead of scanning the import chunk around it.
+    // gpu_buffer_bind does the same for descriptor-backed ranges.
+    if (p->sparse_guest && !sparse_guest_bind(*p, guest, guest + size, false, false)) return {};
+#endif
     if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;   // (in use: not given back under it, imports_give_back)
     return {p->buffer, guest - p->lo, size, p->address + (guest - p->lo)};
 }
