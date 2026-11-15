@@ -49,6 +49,7 @@
 #include "host_shaders/bc_encoder_comp_spv.h"
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
+#include "texture_memory_policy.h"
 #include "keep_rendered.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
@@ -60,6 +61,15 @@ namespace {
 uint64_t mix(uint64_t h, uint64_t v) {
     h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
     return h * 0xff51afd7ed558ccdull;
+}
+
+uint64_t texture_policy_allowance(uint64_t driver_allowed) {
+    static const uint64_t configured = [] {
+        const char* e = getenv("RX_VK_VRAM_MB");
+        return e ? (uint64_t)std::max(0, atoi(e)) << 20 : 0;
+    }();
+    return texture_memory_policy::effective_allowance(
+        driver_allowed, dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU, configured);
 }
 
 // ---- formats ----
@@ -1756,8 +1766,12 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         static const bool all = [] {
             if (const char* e = getenv("RX_VK_ASTC_BC_ALL")) return e[0] == '1';
             uint64_t used = 0, allowed = 0;
-            const bool small = vram_usage(&used, &allowed) && astc_bc_policy::all_by_vram(allowed);
-            if (small) logf("vk: %llu MB of VRAM allowed: all large ASTC textures kept as BC3", (unsigned long long)(allowed >> 20));
+            const bool known = vram_usage(&used, &allowed);
+            const uint64_t effective = texture_policy_allowance(known ? allowed : 0);
+            const bool small = astc_bc_policy::all_by_vram(effective);
+            if (small)
+                logf("vk: %llu MB effective texture allowance (%llu MB driver): all large ASTC textures kept as BC3",
+                     (unsigned long long)(effective >> 20), (unsigned long long)(allowed >> 20));
             return small;
         }();
         const uint64_t min_bytes = (bw * bh >= 36 || all) ? low : 64ull << 20;
@@ -3528,7 +3542,8 @@ void texture_frame(uint64_t completed) {
         static const uint64_t keep = []() -> uint64_t {
             if (const char* e = getenv("RX_VK_STAGING_KEEP_MB")) return (uint64_t)atoi(e) << 20;
             uint64_t used = 0, allowed = 0;
-            return (vram_usage(&used, &allowed) && allowed <= (6ull << 30) + (512ull << 20) ? 64ull : 256ull) << 20;
+            const bool known = vram_usage(&used, &allowed);
+            return texture_memory_policy::staging_keep(texture_policy_allowance(known ? allowed : 0));
         }();
         uint64_t kept = 0;
         for (auto it = arenas.begin(); it != arenas.end();) {
