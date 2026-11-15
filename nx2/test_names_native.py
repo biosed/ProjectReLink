@@ -1,4 +1,4 @@
-"""Test that native name-search loops preserve the guest scheduler checkpoint.
+"""Test native name-search comparison state and guest scheduler checkpoints.
 
 No game data, guest memory, renderer, or platform thread is used.
 
@@ -30,6 +30,7 @@ void hos_log(const char *fmt, ...) { (void)fmt; }
 
 int hos_names_lower(Ctx *c);
 int hos_names_upper(Ctx *c, int at_head);
+int hos_names_test_str_cmp(Ctx *c, uint64_t element, uint64_t target, uint32_t neg, uint64_t out[7]);
 
 int main(void) {
     Ctx c = {0};
@@ -45,7 +46,53 @@ int main(void) {
     CHECK(checkpoints == 2);
     CHECK(hos_names_upper(&c, 0) == 0);
     CHECK(checkpoints == 2);
-    puts("PASS: native name-search entries preserve virtual-core preemption");
+
+    uint64_t out[7] = {0};
+    char equal_a[] = "abc", equal_b[] = "abc";
+    CHECK(hos_names_test_str_cmp(&c, (uint64_t)(uintptr_t)equal_a, (uint64_t)(uintptr_t)equal_b, 1, out) == 0);
+    CHECK((uint32_t)out[0] == 0);
+    CHECK(out[1] == (uint64_t)(uintptr_t)equal_b + 3);
+    CHECK(out[2] == (uint64_t)(uintptr_t)equal_a + 3);
+    CHECK(out[3] == 0x400000);
+    CHECK((uint32_t)out[4] == 0 && (uint32_t)out[5] == 0 && (uint32_t)out[6] == UINT32_MAX);
+
+    char lower[] = "abc", greater[] = "abd";
+    CHECK(hos_names_test_str_cmp(&c, (uint64_t)(uintptr_t)lower, (uint64_t)(uintptr_t)greater, 1, out) == 0);
+    CHECK((uint32_t)out[0] == 1 && (uint32_t)out[4] == 'c' && (uint32_t)out[5] == 'd' && (uint32_t)out[6] == 1);
+    CHECK(hos_names_test_str_cmp(&c, (uint64_t)(uintptr_t)greater, (uint64_t)(uintptr_t)lower, 1, out) == 0);
+    CHECK((uint32_t)out[0] == UINT32_MAX && (uint32_t)out[4] == 'd' && (uint32_t)out[5] == 'c');
+
+    char long_a[] = "abcdefghX", long_b[] = "abcdefghY";
+    c.poll = 1;
+    CHECK(hos_names_test_str_cmp(&c, (uint64_t)(uintptr_t)long_a, (uint64_t)(uintptr_t)long_b, 1, out) == 0);
+    CHECK(c.poll == 0 && checkpoints == 3);
+    CHECK(out[1] == (uint64_t)(uintptr_t)long_b + 11);
+    CHECK(out[2] == (uint64_t)(uintptr_t)long_a + 11);
+    CHECK(out[3] == 0x3ffff8);
+    CHECK((uint32_t)out[0] == 1 && (uint32_t)out[4] == 'X' && (uint32_t)out[5] == 'Y');
+
+    char scan_a[48], scan_b[48];
+    for (int len = 0; len < 32; len++) {
+        for (int i = 0; i < len; i++) scan_a[i] = scan_b[i] = (char)('A' + i % 23);
+        scan_a[len] = scan_b[len] = 0;
+        CHECK(hos_names_test_str_cmp(&c, (uint64_t)(uintptr_t)scan_a, (uint64_t)(uintptr_t)scan_b, 1, out) == 0);
+        CHECK((uint32_t)out[0] == 0 && (uint32_t)out[4] == 0 && (uint32_t)out[5] == 0);
+        CHECK(out[1] == (uint64_t)(uintptr_t)scan_b + 3 + (uint64_t)(len / 8) * 8);
+        CHECK(out[2] == (uint64_t)(uintptr_t)scan_a + 3 + (uint64_t)(len / 8) * 8);
+        CHECK(out[3] == 0x400000 - (uint64_t)(len / 8) * 8);
+        for (int different = 0; different < len; different++) {
+            scan_b[different]++;
+            CHECK(hos_names_test_str_cmp(&c, (uint64_t)(uintptr_t)scan_a, (uint64_t)(uintptr_t)scan_b, 1, out) == 0);
+            CHECK((uint32_t)out[0] == 1);
+            CHECK((uint32_t)out[4] == (uint8_t)scan_a[different]);
+            CHECK((uint32_t)out[5] == (uint8_t)scan_b[different]);
+            CHECK(out[1] == (uint64_t)(uintptr_t)scan_b + 3 + (uint64_t)(different / 8) * 8);
+            CHECK(out[2] == (uint64_t)(uintptr_t)scan_a + 3 + (uint64_t)(different / 8) * 8);
+            CHECK(out[3] == 0x400000 - (uint64_t)(different / 8) * 8);
+            scan_b[different]--;
+        }
+    }
+    puts("PASS: native name-search comparisons preserve state and virtual-core preemption");
 }
 '''
     work = ROOT / "work"
@@ -79,6 +126,7 @@ int main(void) {
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                "-DHOS_NAMES_TEST",
                 "-I",
                 str(ROOT),
                 "-I",
