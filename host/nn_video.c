@@ -305,7 +305,13 @@ static void dec_finalize(Ctx *c) {
 static void queue_frame(Dec *d, const AVFrame *f) {
     const int w = f->width, h = f->height;
     if (w <= 0 || h <= 0) return;
-    if (f->format != AV_PIX_FMT_NV12 && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
+    /* Media Foundation returns NV12.  Linux's dav1d returns planar 4:2:0,
+       which is just as suitable for the NV12 path below and is what OoT
+       reads.  Keep RGBA lazy for both instead of allocating and converting
+       an otherwise unused 8.3 MB 1080p image for every decoded frame. */
+    const int direct_nv12 = f->format == AV_PIX_FMT_NV12 || f->format == AV_PIX_FMT_YUV420P ||
+                            f->format == AV_PIX_FMT_YUVA420P;
+    if (!direct_nv12 && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
         if (d->sws) sws_freeContext(d->sws);
         d->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
         d->sws_w = w, d->sws_h = h, d->sws_fmt = f->format;
@@ -313,9 +319,9 @@ static void queue_frame(Dec *d, const AVFrame *f) {
     Picture p = {0};
     p.w = w, p.h = h, p.pts = f->pts;
     const int nv12 = f->format == AV_PIX_FMT_NV12;   /* (relink: Media Foundation's pictures, kept as NV12 alone) */
-    p.rgba = nv12 ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
-    p.nv12 = nv12 ? (uint8_t *)malloc((size_t)w * h * 3 / 2) : (uint8_t *)calloc(1, (size_t)w * h * 3 / 2);
-    if (!p.nv12 || (!nv12 && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
+    p.rgba = direct_nv12 ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
+    p.nv12 = direct_nv12 ? (uint8_t *)malloc((size_t)w * h * 3 / 2) : (uint8_t *)calloc(1, (size_t)w * h * 3 / 2);
+    if (!p.nv12 || (!direct_nv12 && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
         static volatile LONG told;
         if (InterlockedIncrement(&told) <= 4) hos_log("video: no memory for a %dx%d frame: dropped", w, h);
         free(p.rgba), free(p.nv12);
