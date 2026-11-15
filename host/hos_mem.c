@@ -144,6 +144,14 @@ static void pages_mark_used_locked(uint64_t addr, uint64_t size) {
     for (uint64_t p = addr >> 12; p < (addr + size + 0xFFF) >> 12 && p < (1ULL << 20); p++) pages_used[p >> 6] |= 1ULL << (p & 63);
 }
 
+void hos_zero_guest_pages(void *p, size_t n) {
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    extern int hos_posix_guest_zero_allocated(void *p, size_t n);
+    if (hos_posix_guest_zero_allocated(p, n) == 0) return;
+#endif
+    memset(p, 0, n);
+}
+
 static void discard_pages(uint64_t addr, uint64_t size) {
     const uint64_t lo = (addr + 0xFFF) & ~0xFFFULL, hi = (addr + size) & ~0xFFFULL;
     static int keep = -1;
@@ -166,7 +174,7 @@ static void discard_pages(uint64_t addr, uint64_t size) {
     extern int rx_guest_imported(uint64_t lo, uint64_t hi);
     /* (pages a dma-buf import holds stay where they are, zeroed: a hole punched under one would leave the GPU on
        the old pages and the game on new ones) */
-    if (rx_guest_imported(lo, hi)) memset(GP(lo), 0, (size_t)(hi - lo));
+    if (rx_guest_imported(lo, hi)) hos_zero_guest_pages(GP(lo), (size_t)(hi - lo));
     else hos_posix_guest_discard(GP(lo), (size_t)(hi - lo));
 #endif
 }
@@ -369,7 +377,7 @@ HLE(_ZN2nn2os15FreeMemoryPagesEmm) {
         region_count(&region_mapped, -(int64_t)ARG(1)), region_count(&region_freed, (int64_t)ARG(1));
         region_note();
         if (hi > lo && rx_guest_imported(lo, hi)) {
-            memset(GP(lo), 0, (size_t)(hi - lo));
+            hos_zero_guest_pages(GP(lo), (size_t)(hi - lo));
             region_count(&region_kept, (int64_t)(hi - lo));
         }
 #if defined(_WIN32)
