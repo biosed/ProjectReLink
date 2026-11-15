@@ -394,41 +394,77 @@ bool sparse_guest_bind_runs(Pool& p, const std::vector<sparse_guest::Run>& runs,
     return true;
 }
 
-/// Back the data blocks in [guest_lo, guest_hi), or every block there when `force` is true. The latter is used before
-/// GPU writes, so their results always land in the guest memfd. `ensure_one` keeps Pool::memory non-null for its lifecycle.
-bool sparse_guest_bind(Pool& p, uint64_t guest_lo, uint64_t guest_hi, bool force, bool ensure_one) {
+/// Back the data blocks in sorted resource-relative ranges, or every block there when `force` is true. The latter is
+/// used before GPU writes, so their results always land in the guest memfd. `ensure_one` keeps Pool::memory non-null.
+bool sparse_guest_bind_ranges(Pool& p, const std::vector<sparse_guest::Run>& scan_ranges, bool force, bool ensure_one) {
     if (!p.sparse_guest || !p.sparse_align || !p.sparse_size) return true;
     const uint64_t blocks = (p.sparse_size + p.sparse_align - 1) / p.sparse_align;
     std::vector<uint8_t> wanted((size_t)blocks);
-    const uint64_t scan_lo = std::max(guest_lo, p.lo);
-    const uint64_t scan_hi = std::min(guest_hi, p.lo + p.sparse_size);
     if (force) {
-        sparse_guest::mark(wanted, p.lo, p.sparse_align, scan_lo, scan_hi);
-    } else if (scan_hi > scan_lo) {
-        const int scanfd = fcntl(dmabuf_memfd, F_DUPFD_CLOEXEC, 0);
-        if (scanfd < 0) return false;
-        for (uint64_t at = scan_lo; at < scan_hi;) {
-            const off_t data = lseek(scanfd, (off_t)at, SEEK_DATA);
-            if (data < 0) {
-                const int e = errno;
-                close(scanfd);
-                if (e == ENXIO) break;
-                if (dmabuf_failures++ < 8) logf("vk: guest sparse scan failed (errno %d)", e);
-                return false;
-            }
-            if ((uint64_t)data >= scan_hi) break;
-            const off_t hole = lseek(scanfd, data, SEEK_HOLE);
-            if (hole < 0) {
-                const int e = errno;
-                close(scanfd);
-                if (dmabuf_failures++ < 8) logf("vk: guest sparse hole scan failed (errno %d)", e);
-                return false;
-            }
-            const uint64_t hi = std::min<uint64_t>((uint64_t)hole, scan_hi);
-            sparse_guest::mark(wanted, p.lo, p.sparse_align, std::max<uint64_t>((uint64_t)data, scan_lo), hi);
-            at = hi > at ? hi : at + 4096;
+        for (const sparse_guest::Run& r : scan_ranges)
+            sparse_guest::mark(wanted, p.lo, p.sparse_align, p.lo + r.offset, p.lo + r.offset + r.size);
+    } else if (!scan_ranges.empty()) {
+        // A changed memfd block count refreshes every live sparse import. Most
+        // of those blocks are normally already bound; walking their often
+        // fragmented SEEK_DATA map again made an area load spend whole frames
+        // in lseek. Only an unbound block can need a new Vulkan binding.
+        std::vector<sparse_guest::Run> unbound;
+        for (const sparse_guest::Run& scan : scan_ranges) {
+            const auto found = sparse_guest::unbound_runs(p.sparse_bound, p.sparse_align, p.sparse_size,
+                                                          scan.offset, scan.offset + scan.size);
+            for (const sparse_guest::Run& r : found)
+                if (!sparse_guest::append_merged(unbound, r)) return false;
         }
-        close(scanfd);
+        if (!unbound.empty()) {
+            const auto scan_started = std::chrono::steady_clock::now();
+            uint64_t scan_seeks = 0;
+            const int scanfd = fcntl(dmabuf_memfd, F_DUPFD_CLOEXEC, 0);
+            if (scanfd < 0) return false;
+            for (const sparse_guest::Run& r : unbound) {
+                const uint64_t run_lo = p.lo + r.offset;
+                const uint64_t run_hi = run_lo + r.size;
+                for (uint64_t at = run_lo; at < run_hi;) {
+                    const off_t data = lseek(scanfd, (off_t)at, SEEK_DATA);
+                    scan_seeks++;
+                    if (data < 0) {
+                        const int e = errno;
+                        if (e == ENXIO) goto sparse_scan_done;
+                        close(scanfd);
+                        if (dmabuf_failures++ < 8) logf("vk: guest sparse scan failed (errno %d)", e);
+                        return false;
+                    }
+                    if ((uint64_t)data >= run_hi) break;
+                    const off_t hole = lseek(scanfd, data, SEEK_HOLE);
+                    scan_seeks++;
+                    if (hole < 0) {
+                        const int e = errno;
+                        close(scanfd);
+                        if (dmabuf_failures++ < 8) logf("vk: guest sparse hole scan failed (errno %d)", e);
+                        return false;
+                    }
+                    const uint64_t hi = std::min<uint64_t>((uint64_t)hole, run_hi);
+                    sparse_guest::mark(wanted, p.lo, p.sparse_align, (uint64_t)data, hi);
+                    // A shmem file can have many page-sized extents inside one
+                    // Vulkan sparse block. The first already makes the complete
+                    // block wanted, so do not issue two more seeks per fragment.
+                    at = sparse_guest::scan_advance(p.lo, p.sparse_align, (uint64_t)data, hi, run_hi);
+                }
+            }
+sparse_scan_done:
+            close(scanfd);
+            const double scan_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - scan_started)
+                                       .count();
+            if (scan_ms >= 20.0) {
+                static int64_t slow_scans;
+                slow_scans++;
+                if (slow_scans <= 32 || slow_scans % 64 == 0)
+                    logf("vk: sparse guest pool %#llx: %.1f ms scanning %llu KB, %zu live / %zu unbound runs, %llu seeks",
+                         (unsigned long long)p.lo, scan_ms,
+                         (unsigned long long)(sparse_guest::bytes(scan_ranges) >> 10), scan_ranges.size(), unbound.size(),
+                         (unsigned long long)scan_seeks);
+            }
+        }
     }
     bool any = false;
     for (uint8_t x : wanted) any |= x != 0;
@@ -451,6 +487,14 @@ bool sparse_guest_bind(Pool& p, uint64_t guest_lo, uint64_t guest_hi, bool force
         return sparse_guest_bind_runs(p, runs, false, false);
     }
     return sparse_guest_bind_runs(p, runs, false, true);
+}
+
+bool sparse_guest_bind(Pool& p, uint64_t guest_lo, uint64_t guest_hi, bool force, bool ensure_one) {
+    std::vector<sparse_guest::Run> ranges;
+    const uint64_t scan_lo = std::max(guest_lo, p.lo);
+    const uint64_t scan_hi = std::min(guest_hi, p.lo + p.sparse_size);
+    if (scan_hi > scan_lo) ranges.push_back({scan_lo - p.lo, scan_hi - scan_lo});
+    return sparse_guest_bind_ranges(p, ranges, force, ensure_one);
 }
 
 struct SparseGuestRelease {
@@ -558,11 +602,14 @@ void sparse_guest_refresh_all() {
     for (auto& kv : imported) {
         Pool& p = kv.second;
         if (!p.sparse_guest) continue;
+        std::vector<sparse_guest::Run> live;
         for (const GuestPool& g : guest_pools) {
             if (g.lo >= p.lo + p.sparse_size) break;
             if (g.hi <= p.lo) continue;
-            if (!sparse_guest_bind(p, std::max(p.lo, g.lo), std::min(p.lo + p.sparse_size, g.hi), false, false)) ok = false;
+            const uint64_t lo = std::max(p.lo, g.lo), hi = std::min(p.lo + p.sparse_size, g.hi);
+            if (hi > lo && !sparse_guest::append_merged(live, {lo - p.lo, hi - lo})) ok = false;
         }
+        if (!live.empty() && !sparse_guest_bind_ranges(p, live, false, false)) ok = false;
     }
     dmabuf_seen_blocks.store(ok ? st.st_blocks : -1, std::memory_order_relaxed);
 }

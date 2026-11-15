@@ -30,6 +30,16 @@ int main() {
     std::vector<uint8_t> wanted(8);
     std::vector<uint64_t> bound(1);
 
+    std::vector<sparse_guest::Run> merged;
+    CHECK(sparse_guest::append_merged(merged, {block, block}));
+    CHECK(sparse_guest::append_merged(merged, {2 * block, block}));
+    CHECK(sparse_guest::append_merged(merged, {2 * block + 1, 2 * block}));
+    CHECK(merged.size() == 1 && merged[0].offset == block && merged[0].size == 3 * block + 1);
+    CHECK(sparse_guest::append_merged(merged, {5 * block, block}));
+    CHECK(merged.size() == 2 && merged[1].offset == 5 * block && merged[1].size == block);
+    CHECK(!sparse_guest::append_merged(merged, {4 * block, block}));
+    CHECK(!sparse_guest::append_merged(merged, {UINT64_MAX, 2}));
+
     sparse_guest::mark(wanted, base, block, base + 4096, base + block + 4096);
     sparse_guest::mark(wanted, base, block, base + 3 * block, base + 4 * block);
     auto runs = sparse_guest::runs(wanted, bound, block);
@@ -55,6 +65,26 @@ int main() {
     sparse_guest::clear_bound(bound, 3, 1);
     CHECK(!sparse_guest::bound(bound, 3) && sparse_guest::bound(bound, 0));
     sparse_guest::clear_bound(bound, 99, 1);
+
+    sparse_guest::clear_bound(bound, 1, 1);
+    sparse_guest::set_bound(bound, 3, 1);
+    auto unbound = sparse_guest::unbound_runs(bound, block, 8 * block, 1, 5 * block + 1);
+    CHECK(unbound.size() == 2);
+    CHECK(unbound[0].offset == block && unbound[0].size == 2 * block);
+    CHECK(unbound[1].offset == 4 * block && unbound[1].size == 2 * block);
+    sparse_guest::set_bound(bound, 1, 2);
+    sparse_guest::set_bound(bound, 4, 2);
+    CHECK(sparse_guest::unbound_runs(bound, block, 8 * block, 1, 5 * block + 1).empty());
+    CHECK(sparse_guest::unbound_runs(bound, 0, 8 * block, 0, block).empty());
+    CHECK(sparse_guest::unbound_runs(bound, block, 8 * block, 8 * block, 9 * block).empty());
+    sparse_guest::clear_bound(bound, 1, 2);
+    sparse_guest::clear_bound(bound, 3, 1);
+    sparse_guest::clear_bound(bound, 4, 2);
+    CHECK(sparse_guest::scan_advance(base, block, base + 17, base + 4096, base + 8 * block) == base + block);
+    CHECK(sparse_guest::scan_advance(base, block, base + 17, base + 3 * block, base + 8 * block) == base + 3 * block);
+    CHECK(sparse_guest::scan_advance(base, block, base + 7 * block, base + 9 * block, base + 8 * block) ==
+          base + 8 * block);
+    CHECK(sparse_guest::scan_advance(base, 0, base, base, base + block) == base + block);
 
     std::fill(wanted.begin(), wanted.end(), 0);
     sparse_guest::mark(wanted, base, block, base + 7 * block + 1, base + 8 * block);

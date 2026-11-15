@@ -11,6 +11,26 @@ struct Run {
     uint64_t offset = 0, size = 0;
 };
 
+/// Append a sorted run, merging overlap and adjacency. False rejects wrapped
+/// or out-of-order input instead of producing an unsafe backing range.
+inline bool append_merged(std::vector<Run>& runs, Run r) {
+    if (!r.size) return true;
+    if (r.offset > UINT64_MAX - r.size) return false;
+    if (runs.empty()) {
+        runs.push_back(r);
+        return true;
+    }
+    Run& last = runs.back();
+    if (last.offset > UINT64_MAX - last.size || r.offset < last.offset) return false;
+    const uint64_t last_hi = last.offset + last.size;
+    if (r.offset > last_hi) {
+        runs.push_back(r);
+        return true;
+    }
+    last.size = std::max(last_hi, r.offset + r.size) - last.offset;
+    return true;
+}
+
 /// Number of bytes actually backed by a packed sparse allocation.  This is
 /// deliberately not the sparse resource's virtual span: holes have no dma-buf
 /// pages and must not be credited as freed under memory pressure.
@@ -100,6 +120,38 @@ inline std::vector<Run> runs(const std::vector<uint8_t>& wanted, const std::vect
         if (block > first) result.push_back({first * block_size, (block - first) * block_size});
     }
     return result;
+}
+
+/// Merge the not-yet-bound blocks touched by [lo, hi) into runs. Offsets are
+/// relative to the sparse resource. This lets callers avoid querying their
+/// backing store again for blocks whose Vulkan bindings already exist.
+inline std::vector<Run> unbound_runs(const std::vector<uint64_t>& bound_words, uint64_t block_size,
+                                     uint64_t resource_size, uint64_t lo, uint64_t hi) {
+    std::vector<Run> result;
+    if (!block_size || hi <= lo || lo >= resource_size) return result;
+    hi = std::min(hi, resource_size);
+    const uint64_t first = lo / block_size;
+    const uint64_t last = (hi - 1) / block_size + 1;
+    for (uint64_t block = first; block < last;) {
+        while (block < last && bound(bound_words, block)) block++;
+        const uint64_t begin = block;
+        while (block < last && !bound(bound_words, block)) block++;
+        if (block > begin) result.push_back({begin * block_size, (block - begin) * block_size});
+    }
+    return result;
+}
+
+/// Continue an extent scan after the sparse block containing `data`. Once any
+/// byte in a block is allocated, that whole block is wanted; visiting further
+/// file extents inside it cannot change the resulting Vulkan binding.
+inline uint64_t scan_advance(uint64_t resource_lo, uint64_t block_size, uint64_t data,
+                             uint64_t hole, uint64_t limit) {
+    if (!block_size || data < resource_lo || hole < data) return limit;
+    const uint64_t block = (data - resource_lo) / block_size;
+    uint64_t block_hi = UINT64_MAX;
+    if (block < (UINT64_MAX - resource_lo) / block_size)
+        block_hi = resource_lo + (block + 1) * block_size;
+    return std::min(limit, std::max(hole, block_hi));
 }
 
 /// Split aligned runs into the packed allocations accepted by UDMABUF_CREATE_LIST.  Both the packed byte total and
