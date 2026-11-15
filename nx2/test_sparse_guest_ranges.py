@@ -75,6 +75,18 @@ int main() {
     CHECK(sparse_guest::all_outside(allocation, base,
                                     std::vector<Live>{{base, base + block}, {base + 2 * block, base + 4 * block}}));
 
+    const auto batches = sparse_guest::batches(
+        std::vector<sparse_guest::Run>{{0, 150 * block}, {200 * block, 3 * block}}, 64 * block, 2, block);
+    CHECK(batches.size() == 3);
+    CHECK(batches[0].size() == 1 && batches[0][0].offset == 0 && batches[0][0].size == 64 * block);
+    CHECK(batches[1].size() == 1 && batches[1][0].offset == 64 * block && batches[1][0].size == 64 * block);
+    CHECK(batches[2].size() == 2);
+    CHECK(batches[2][0].offset == 128 * block && batches[2][0].size == 22 * block);
+    CHECK(batches[2][1].offset == 200 * block && batches[2][1].size == 3 * block);
+    CHECK(sparse_guest::batches({{1, block}}, 64 * block, 2, block).empty());
+    CHECK(sparse_guest::batches({{0, block}}, block - 1, 2, block).empty());
+    CHECK(sparse_guest::batches({{UINT64_MAX - block + 1, block}}, 64 * block, 2, block).empty());
+
     std::puts("PASS: sparse guest ranges round, merge, release, and exclude live blocks");
 }
 '''

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace sparse_guest {
@@ -86,6 +87,46 @@ inline std::vector<Run> runs(const std::vector<uint8_t>& wanted, const std::vect
         while (block < wanted.size() && wanted[(size_t)block] && !bound(bound_words, block)) block++;
         if (block > first) result.push_back({first * block_size, (block - first) * block_size});
     }
+    return result;
+}
+
+/// Split aligned runs into the packed allocations accepted by UDMABUF_CREATE_LIST.  Both the packed byte total and
+/// extent count are per ioctl; a single contiguous run may therefore become several allocations.  An empty result for
+/// non-empty input means the limits or the input alignment are invalid.
+inline std::vector<std::vector<Run>> batches(const std::vector<Run>& input, uint64_t max_bytes,
+                                             uint64_t max_runs, uint64_t alignment) {
+    std::vector<std::vector<Run>> result;
+    if (input.empty()) return result;
+    if (!max_bytes || !max_runs || !alignment) return result;
+    const uint64_t byte_limit = max_bytes / alignment * alignment;
+    if (!byte_limit) return result;
+    std::vector<Run> batch;
+    uint64_t bytes = 0;
+    const auto finish = [&] {
+        if (!batch.empty()) result.push_back(std::move(batch));
+        batch.clear();
+        bytes = 0;
+    };
+    for (const Run& r : input) {
+        if (!r.size || r.offset % alignment || r.size % alignment || r.size > UINT64_MAX - r.offset) {
+            result.clear();
+            return result;
+        }
+        uint64_t offset = r.offset, left = r.size;
+        while (left) {
+            if (bytes == byte_limit || batch.size() >= max_runs) finish();
+            const uint64_t take = std::min(left, byte_limit - bytes);
+            if (!take || take % alignment) {
+                result.clear();
+                return result;
+            }
+            batch.push_back({offset, take});
+            bytes += take;
+            offset += take;
+            left -= take;
+        }
+    }
+    finish();
     return result;
 }
 

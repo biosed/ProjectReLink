@@ -299,9 +299,9 @@ VkResult bind_sparse_buffer(VkBuffer buffer, const std::vector<VkSparseMemoryBin
     return bind_sparse_buffers(buffers, drain_before);
 }
 
-/// Import and bind one allocation's runs. The primary allocation is deliberately one block: Pool::memory remains valid
-/// even when every other allocation is released, while at most one sparse block stays pinned for that bookkeeping rule.
-bool sparse_guest_bind_runs(Pool& p, const std::vector<sparse_guest::Run>& runs, bool keep, bool drain_before) {
+/// Import and bind one allocation's bounded runs. The primary allocation is deliberately one block: Pool::memory remains
+/// valid even when every other allocation is released, while at most one sparse block stays pinned for that bookkeeping rule.
+bool sparse_guest_bind_batch(Pool& p, const std::vector<sparse_guest::Run>& runs, bool keep, bool drain_before) {
     if (runs.empty()) return true;
     uint64_t packed_size = 0;
     for (const sparse_guest::Run& r : runs) packed_size += r.size;
@@ -353,6 +353,29 @@ bool sparse_guest_bind_runs(Pool& p, const std::vector<sparse_guest::Run>& runs,
         logf("vk: sparse guest pool %#llx: bound %zu runs / %llu KB (%lld binds, %llu MB in all)",
              (unsigned long long)p.lo, runs.size(), (unsigned long long)(packed_size >> 10), (long long)bound_calls,
              (unsigned long long)(bound_bytes >> 20));
+    return true;
+}
+
+/// Import any number of runs as as many bounded UDMABUF_CREATE_LIST allocations as the kernel's byte and extent limits
+/// require. A run itself may be larger than size_limit_mb; splitting it preserves the sparse resource instead of falling
+/// back to a dense import that pins all of its holes.
+bool sparse_guest_bind_runs(Pool& p, const std::vector<sparse_guest::Run>& runs, bool keep, bool drain_before) {
+    if (runs.empty()) return true;
+    const uint64_t list_limit = std::min<uint64_t>(dmabuf_list_limit, UINT32_MAX);
+    const auto batches = sparse_guest::batches(runs, dmabuf_limit, list_limit, p.sparse_align);
+    if (batches.empty()) {
+        if (dmabuf_failures++ < 8)
+            logf("vk: pool %#llx: sparse guest runs cannot fit udmabuf's %llu MB / %llu-extent lists",
+                 (unsigned long long)p.lo, (unsigned long long)(dmabuf_limit >> 20),
+                 (unsigned long long)dmabuf_list_limit);
+        return false;
+    }
+    static int split_logged;
+    if (batches.size() > 1 && split_logged++ < 16)
+        logf("vk: pool %#llx: %zu sparse guest runs split across %zu udmabuf lists",
+             (unsigned long long)p.lo, runs.size(), batches.size());
+    for (size_t i = 0; i < batches.size(); i++)
+        if (!sparse_guest_bind_batch(p, batches[i], keep && i == 0, drain_before && i == 0)) return false;
     return true;
 }
 
