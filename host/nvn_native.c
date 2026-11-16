@@ -2243,7 +2243,7 @@ NV(nvnQueueSubmitCommands) {
            Nothing in the replay runs guest code or needs the core) */
         const int away = hos_vcore_away();
         rx_nvn_submit_q(h, n, (uint64_t)(uintptr_t)q);
-        if (away) hos_vcore_back();
+        if (away) hos_vcore_back_first();
         return;
     }
     EnterCriticalSection(&held_cs);

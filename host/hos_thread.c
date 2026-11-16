@@ -35,6 +35,7 @@ struct HosThread {
     /* virtual cores (HOS_VCORES): the core held + 1 (0: none), the last one, a better waiter's request, queued, and
        whether it has run without one since an escape (vc_acquire; until its next block: hos_vcore_away) */
     int vc_held, vc_last, vc_queued, vc_escaped;
+    int vc_boost;   /* priority steps better while holding the core taken back after replay */
     volatile int vc_kick;
     int vc_prio_over;   /* (relink, HOS_VC_PRIO) the priority the virtual cores schedule it at, 0: its own */
     int64_t vc_since;
@@ -1192,7 +1193,9 @@ static unsigned vc_allowed(HosThread *t) {
     return m;
 }
 /* a runs before b */
-static int vcp(const HosThread *t) { return t->vc_prio_over ? t->vc_prio_over : t->priority; }
+static int vcp(const HosThread *t) {
+    return (t->vc_prio_over ? t->vc_prio_over : t->priority) - t->vc_boost;
+}
 static int vc_better(HosThread *a, HosThread *b) {
     return vcp(a) != vcp(b) ? vcp(a) < vcp(b) : a->vc_since < b->vc_since;
 }
@@ -1425,6 +1428,7 @@ static void vc_acquire(HosThread *t) {
         if (waited > (worst ? esc_better : esc_eq)) {
             vc_dequeue(t);
             t->vc_escaped = 1;
+            t->vc_boost = 0;   /* no core on which to keep the temporary place */
             vc_st.escapes++;
             static int logged;
             if (logged < 40) {
@@ -1456,6 +1460,7 @@ static void vc_release(HosThread *t) {
     vc_owner[c] = NULL;
     t->vc_held = 0;
     t->vc_kick = 0;
+    t->vc_boost = 0;   /* a real block ends the post-replay place */
     vc_grant(c);
     /* (relink, vc_bg_cap) fewer cores held: a background thread kept waiting by the cap may take a free core of its own
        mask now, not only this one */
@@ -1480,7 +1485,9 @@ static void vc_yield(HosThread *t, int strict) {
     if (any) vc_st.yields++;
     ReleaseSRWLockExclusive(&vc_lock);
     if (!any) return;
+    const int boost = t->vc_boost;   /* yielding to a better waiter is not a block */
     vc_release(t);
+    t->vc_boost = boost;
     vc_acquire(t);
 }
 /* 1 when the caller is to take a core again after its block (hos_vcore_back): it gave its core up, or it has run without
@@ -1507,6 +1514,20 @@ void hos_vcore_back(void) {
     HosThread *t = cur;
     if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
 }
+/* After host-only replay work, let the submitting guest thread take a core ahead of
+   nearby-priority workers. Its normal priority is restored at the next real block.
+   HOS_VCORE_REPLAY_BOOST=0 keeps the previous ordering. */
+void hos_vcore_back_first(void) {
+    static int steps = -1;
+    if (steps < 0)
+        steps = getenv("HOS_VCORE_REPLAY_BOOST") ? atoi(getenv("HOS_VCORE_REPLAY_BOOST")) : 2;
+    HosThread *t = cur;
+    if (!hos_vcores_on() || !t) return;
+    t->vc_escaped = 0;
+    if (t->vc_held) return;
+    t->vc_boost = steps > 0 && steps < 64 ? steps : 0;
+    vc_acquire(t);
+}
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
     if (t && t->vc_kick) vc_yield(t, t->vc_kick == 1);
@@ -1532,6 +1553,7 @@ int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
 int hos_vcores_on(void) { return 0; }
 int hos_vcore_away(void) { return 0; }
 void hos_vcore_back(void) {}
+void hos_vcore_back_first(void) {}
 void hos_vcore_checkpoint(void) {}
 void hos_vcore_yield(void) {}
 int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
