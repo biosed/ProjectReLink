@@ -3957,7 +3957,7 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
     // ~15% to submit. With a queue of their own (dev.present_queue, a compute family's: vk_main.cpp create_device) the presents go
     // out with the submits' lock let go: the blit above signals swap_rendered on the replay's queue (submitted already, as a binary
     // semaphore's wait needs). (Waiting for the blit's fence before the present, with the lock let go, was worse.)
-    if (dev.present_queue) {
+    if (dev.present_queue && !reflex_use_main_queue()) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
         res = vkQueuePresentKHR(dev.present_queue, &pi);

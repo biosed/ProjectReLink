@@ -154,6 +154,7 @@ bool has_extension(const std::vector<VkExtensionProperties>& all, const char* na
 }
 
 bool create_instance() {
+    reflex_enable_implicit_layer();
     uint32_t version = VK_API_VERSION_1_0;
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&version);
     if (version < VK_API_VERSION_1_3) {
