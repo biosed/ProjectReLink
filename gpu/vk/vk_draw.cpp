@@ -3782,6 +3782,15 @@ thread_local DynState last_dyn;
 thread_local bool last_dyn_valid = false;
 #define DYN_CHANGED(f) ((!last_dyn_valid || std::memcmp(&d.f, &last_dyn.f, sizeof d.f)) && (FINE_X(FC_DYN_CALLS, 1), true))
 
+// A renderer helper may bind its own graphics pipeline, dynamic state, vertex/index streams and push descriptors.
+// Forget every cached guest draw binding before the next draw; otherwise it can skip commands whose Vulkan state the
+// helper replaced. This is deliberately separate from descriptors_disturbed(), which also covers compute-only helpers.
+void graphics_state_disturbed() {
+    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    vertex_set.on = false, last_ib.on = false;
+    descriptors_disturbed();
+}
+
 /// The inputs a draw's dynamic state is built from. Most draws repeat the draw before them.
 bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t* raw, int nb, const float* cfp,
               const uint32_t* cup, const uint8_t* craw) {
@@ -7017,8 +7026,13 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
                 // A gameplay network that did not translate reaches this stub before dispatch() can call
                 // dlss_stand_in. Give the requested external upscaler the same scene input/output here; if it cannot
                 // take this frame, keep the existing typed fallback as the bounded, visible recovery path.
-                if ((dlss_wanted() && dlss_upscale(cmd, key, gameplay_network(key), src, input_view, dst, output_view, 0)) ||
-                    typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", false)) {
+                bool external = false;
+                if (dlss_wanted()) {
+                    external = dlss_upscale(cmd, key, gameplay_network(key), src, input_view, dst, output_view, 0);
+                    // dlss_upscale may have drawn actor motion before returning false; either result replaces graphics state.
+                    graphics_state_disturbed();
+                }
+                if (external || typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", false)) {
                     full_barrier(cmd);
                     texture_written(dst);
                     return true;
@@ -7216,8 +7230,7 @@ bool dlss_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     if (out_handle) texture_view_of(out_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     const bool done = dlss_upscale(cmd, p.key, gameplay_network(p.key), in, dw().imgs[0].imageView, out, dw().imgs[ntex].imageView, level);
     // (its actor motion may have drawn with a pipeline, viewport and descriptors of its own: the next draw sets all of its again)
-    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
-    vertex_set.on = false, last_ib.on = false;
+    graphics_state_disturbed();
     return done;
 }
 /// (relink) After the gameplay upscale wrote its output (the game's network, or DLSS in its place: stood_in),
