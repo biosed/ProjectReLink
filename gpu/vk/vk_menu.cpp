@@ -121,14 +121,21 @@ const char* tx_upscale(int v) {
 /// The Window scaling filter row's value: its filter, or that none is needed (the saved value stays, for another window size)
 const char* tx_filter(int v) { return filter_needed() ? tx_upscale(v) : "Not needed (window = output)"; }
 const char* tx_reflex(int v) {
+    if (reflex_is_amd()) return v > 0 ? "On (AMD Anti-Lag 2)" : "Off";
     static const char* t[] = {"Off", "On", "On + Boost"};
     return t[reflex_available() ? std::clamp(v, 0, 2) : 0];
 }
-/// Reflex: on the value, or that it is not available here (the row shows Off)
+/// Reflex / Anti-Lag: on the value, or that it is not available here (the row shows Off)
 const char* hn_reflex(int v, int variant) {
     static const char* const t[] = {"The game as without it.", "The driver paces the frames for less latency.",
                                     "As On, and the GPU's clocks are kept up as well."};
-    static const char* const none = "Not available here: it needs an NVIDIA GPU whose driver has VK_NV_low_latency2.";
+    static const char* const t_amd[] = {"The game as without it.",
+                                        "AMD Anti-Lag 2 (VK_AMD_anti_lag) paces CPU simulation to reduce input latency."};
+    static const char* const none = "Not available here: needs VK_NV_low_latency2 (NVIDIA) or VK_AMD_anti_lag (AMD).";
+    if (reflex_is_amd()) {
+        const char* cur = t_amd[v > 0 ? 1 : 0];
+        return variant < 0 || variant == 0 ? cur : variant == 1 ? none : nullptr;
+    }
     if (variant < 0) return reflex_available() ? t[std::clamp(v, 0, 2)] : none;
     return variant == 0 ? t[std::clamp(v, 0, 2)] : variant == 1 ? none : nullptr;
 }
@@ -169,9 +176,15 @@ const char* hn_upscaler(int v, int variant) {
         "AMD FSR: not started yet.",
         "AMD FSR: Windows only.",
         "AMD FSR: off for this run (RX_VK_FSR=0).",
+#if defined(__linux__)
+        "AMD FSR: libamd_fidelityfx_vk.so is not in the game folder (nor set in RX_VK_FSR_LIB).",
+        "AMD FSR: libamd_fidelityfx_vk.so did not load (the log says why).",
+        "AMD FSR: libamd_fidelityfx_vk.so has no upscaler for Vulkan.",
+#else
         "AMD FSR: AMD's amd_fidelityfx_vk.dll is not in the game folder.",
         "AMD FSR: amd_fidelityfx_vk.dll did not load (the log says why; it needs Microsoft's Visual C++ runtime).",
         "AMD FSR: amd_fidelityfx_vk.dll has no upscaler for Vulkan.",
+#endif
         "AMD FSR: this GPU or its driver cannot run it.",
     };
     // (now: the value shown and what runs here; every one: each value, and the game's own with each pair of reasons)
@@ -516,8 +529,8 @@ Row rows[] = {
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
      "show artifacts.", hn_framegen},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
-    {TAB_GRAPHICS, "NVIDIA Reflex", &opts.reflex, 0, 2, 1, tx_reflex,
-     "NVIDIA GPUs: each frame starts as late as it can, for less input delay. Not used with frame generation.", hn_reflex},
+    {TAB_GRAPHICS, "Low latency", &opts.reflex, 0, 2, 1, tx_reflex,
+     "NVIDIA Reflex / AMD Anti-Lag 2: starts each frame as late as it can, for less input delay. Not used with frame generation.", hn_reflex},
     // (the picture's way, top to bottom: the output's size, what fills it from the 3D, the 3D's size, then the window)
     {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
      "The game's whole frame, HUD included, before it is scaled to the window. Docked only. Applies after a restart.",
