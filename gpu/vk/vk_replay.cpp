@@ -71,8 +71,9 @@ uint64_t rec_seq = 0;                       // (the recordings submitted so far;
 std::vector<uint64_t> rec_open_values;      // (the submissions finished in the recording being made; replay_mu)
 std::mutex rec_map_mu;
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
-std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (sync_order_mu)
-std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (sync_order_mu)
+std::mutex q_map_mu;                         // protects q_last + value_queue (acquired alone or inside sync_order_mu / submit_order_mu)
+std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (q_map_mu)
+std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (q_map_mu)
 std::atomic<uint64_t> pushed{0};
 std::atomic<uint64_t> q_values{0};   // the fence values handed out (a submit or a present takes one each)
 std::mutex replay_mu;   // one replay at a time (the game submits from several threads)
@@ -2475,7 +2476,14 @@ bool sync_waits_on() {
     static const bool v = !getenv("RX_VK_SYNC_WAITS") || atoi(getenv("RX_VK_SYNC_WAITS")) != 0;
     return v && event_waits_on() && !async_on() && !dump_on();
 }
+bool defer_main_replay_on() {
+    static const bool v = getenv("RX_VK_DEFER_MAIN_REPLAY") && atoi(getenv("RX_VK_DEFER_MAIN_REPLAY")) != 0;
+    return v;
+}
+void drain_deferred_submits(uint64_t up_to_value = UINT64_MAX);
+bool defer_behind();
 void sync_drain(int why) {
+    if (defer_main_replay_on()) drain_deferred_submits();
     if (!blocked_n.load()) return;
     std::lock_guard lk(sync_order_mu);
     drain(why);
@@ -2483,6 +2491,7 @@ void sync_drain(int why) {
 }
 /// (relink) The stopped queues whose waits are met go on; none is forced past its wait
 void sync_settle() {
+    if (defer_main_replay_on()) drain_deferred_submits();
     if (!blocked_n.load()) return;
     std::lock_guard lk(sync_order_mu);
     burst_begin(0);
@@ -2555,11 +2564,13 @@ uint64_t fence();
 uint64_t fence_q(uint64_t queue) {
     if (async_on() || !sync_waits_on() || per_queue_fences_off() || !queue) return fence();
     std::lock_guard lk(sync_order_mu);
+    std::lock_guard qk(q_map_mu);
     auto it = q_last.find(queue);
     return it != q_last.end() ? it->second : fence();
 }
 int wait(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
+    if (!async_on() && sync_waits_on() && defer_main_replay_on()) drain_deferred_submits(f);
     queue_flush_for(FR_WAIT);
     // (relink) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
     // queues' stopped work the timeline above waits for (which a wait for it forced past its waits after RX_VK_WAIT_HOLD_US)
@@ -2567,9 +2578,15 @@ int wait(uint64_t f, uint64_t timeout_ns) {
         bool mine = false;
         {
             std::lock_guard lk(sync_order_mu);
-            auto it = value_queue.find(f);
-            if (it != value_queue.end()) {
-                auto q = qruns.find(it->second);
+            uint64_t qid = 0;
+            bool have_q = false;
+            {
+                std::lock_guard qk(q_map_mu);
+                auto it = value_queue.find(f);
+                if (it != value_queue.end()) qid = it->second, have_q = true;
+            }
+            if (have_q) {
+                auto q = qruns.find(qid);
                 mine = q == qruns.end() || !q->second.blocked() || q->second.oldest() > f;
             }
         }
@@ -4216,6 +4233,7 @@ void enqueue(Job&& j) {
 
 void wait_queue_empty() {
     if (!async_on()) {
+        if (defer_main_replay_on()) drain_deferred_submits();
         // A catch-up (a queue finish, a CPU read back of what the GPU wrote, a pool remapped) used to force every queue
         // stopped at an event wait past it. The work those waits are for is mostly not submitted yet (the waiting thread is the one
         // that submits it), so the stopped submission went on without it and its lit passes read what that work makes before it
@@ -4242,14 +4260,113 @@ void wait_queue_empty() {
 }
 /// (work handed to the replay thread and not yet recorded)
 bool replay_behind() {
-    if (!async_on()) return blocked_n.load() > 0;
+    if (!async_on()) return (defer_main_replay_on() && defer_behind()) || blocked_n.load() > 0;
     std::lock_guard lk(q_mu);
     return !q_jobs.empty() || q_busy || blocked_n.load() > 0;
 }
 
 std::mutex submit_order_mu;   // (captures and submits queued in the same order)
+struct DeferredSubmit {
+    std::vector<uint64_t> handles;
+    uint64_t value = 0, queue = 0, ticket = 0;
+};
+std::mutex defer_mu;
+std::condition_variable defer_cv, defer_done_cv;
+std::deque<DeferredSubmit> defer_jobs;
+uint64_t defer_next_ticket = 0, defer_served_ticket = 0;
+uint64_t defer_served_max_value = 0;
+
+bool defer_behind() {
+    std::lock_guard lk(defer_mu);
+    return defer_served_ticket < defer_next_ticket;
+}
+void drain_deferred_submits(uint64_t up_to_value) {
+    uint64_t target = 0;
+    {
+        std::lock_guard lk(defer_mu);
+        if (defer_served_ticket >= defer_next_ticket) return;
+        if (up_to_value != UINT64_MAX && defer_served_max_value >= up_to_value) return;
+        target = defer_next_ticket;
+    }
+    std::unique_lock lk(defer_mu);
+    defer_done_cv.wait(lk, [target] { return defer_served_ticket >= target; });
+}
+void defer_worker_main() {
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk main-sub");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    for (;;) {
+        DeferredSubmit j;
+        {
+            std::unique_lock lk(defer_mu);
+            defer_cv.wait(lk, [] { return !defer_jobs.empty() && defer_served_ticket == defer_jobs.front().ticket; });
+            j = std::move(defer_jobs.front());
+            defer_jobs.pop_front();
+        }
+        {
+            std::lock_guard order(sync_order_mu);
+            submit_job(j.handles, j.value, j.queue);
+            update_blocked();
+        }
+        {
+            std::lock_guard lk(defer_mu);
+            if (j.value > defer_served_max_value) defer_served_max_value = j.value;
+            defer_served_ticket++;
+        }
+        defer_cv.notify_one();
+        defer_done_cv.notify_all();
+    }
+}
+
 void submit_q(const uint64_t* handles, int n, uint64_t queue) {
     if (!async_on()) {
+        if (sync_waits_on() && defer_main_replay_on()) {
+            static std::once_flag watch, dwork;
+            std::call_once(watch, [] { std::thread(sync_watch).detach(); });
+            std::call_once(dwork, [] {
+                std::thread(defer_worker_main).detach();
+                logf("vk: non-presenting thread submits captured synchronously, replayed off Chain A (RX_VK_DEFER_MAIN_REPLAY=1)");
+            });
+            static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
+            std::vector<uint64_t> h(handles, handles + std::max(n, 0));
+            const DWORD ptid = present_tid.load(std::memory_order_relaxed);
+            const bool is_non_present = ptid != 0 && GetCurrentThreadId() != ptid;
+            uint64_t value = 0, ticket = 0;
+            {
+                std::lock_guard sl(submit_order_mu);
+                if (capture) memory_capture_submit();   // synchronous on game caller thread: exact FIFO match with ticket
+                value = ++q_values;
+                if (queue) {
+                    std::lock_guard qk(q_map_mu);
+                    q_last[queue] = value;
+                    value_queue[value] = queue;
+                    while (value_queue.size() > 8192) value_queue.erase(value_queue.begin());
+                }
+                std::lock_guard dl(defer_mu);
+                ticket = defer_next_ticket++;
+                if (is_non_present) {
+                    defer_jobs.push_back({std::move(h), value, queue, ticket});
+                    defer_cv.notify_one();
+                    return;
+                }
+            }
+            {
+                std::unique_lock dl(defer_mu);
+                defer_done_cv.wait(dl, [ticket] { return defer_served_ticket == ticket; });
+            }
+            {
+                std::lock_guard order(sync_order_mu);
+                submit_job(h, value, queue);
+                update_blocked();
+            }
+            {
+                std::lock_guard dl(defer_mu);
+                if (value > defer_served_max_value) defer_served_max_value = value;
+                defer_served_ticket++;
+            }
+            defer_cv.notify_one();
+            defer_done_cv.notify_all();
+            return;
+        }
         std::lock_guard order(sync_order_mu);
         // (the replay here is on the submitting thread, but the game's other threads go on writing their next frames: a pool
         // synced from guest memory later in the frame read those. The capture is taken here too)
@@ -4272,6 +4389,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
             std::vector<uint64_t> h(handles, handles + std::max(n, 0));
             const uint64_t value = ++q_values;
             if (queue) {
+                std::lock_guard qk(q_map_mu);
                 q_last[queue] = value;
                 value_queue[value] = queue;
                 while (value_queue.size() > 8192) value_queue.erase(value_queue.begin());
@@ -4296,6 +4414,7 @@ void present(const nvn_tex* t, const int crop[4]) {
     present_tid.store(GetCurrentThreadId(), std::memory_order_relaxed);
     value_at_present.store(value_begun.load(std::memory_order_relaxed), std::memory_order_relaxed);   // (vk_present_value)
     if (!async_on()) {
+        if (defer_main_replay_on()) drain_deferred_submits();
         std::lock_guard order(sync_order_mu);
         if (sync_waits_on()) {
             drain(0);   // (the frame's work whole before it is shown)
