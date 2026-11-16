@@ -4333,7 +4333,9 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
             uint64_t value = 0, ticket = 0;
             {
                 std::lock_guard sl(submit_order_mu);
-                if (capture) memory_capture_submit();   // synchronous on game caller thread: exact FIFO match with ticket
+                // The capture is synchronous for the exact FIFO snapshot. Its late-page wait must stay here too: moving that
+                // wait and second copy to the deferred worker lets the game rewrite shared exposure data in the meantime.
+                if (capture) memory_capture_submit(true);
                 value = ++q_values;
                 if (queue) {
                     std::lock_guard qk(q_map_mu);
@@ -4375,7 +4377,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         // counted into the other set, and the foliage, grass, characters and particles of that frame were never drawn.
         // With it the syncs take the submits' captures, as the console's GPU sees its memory. RX_VK_SYNC_CAPTURE=0: off.
         static const bool capture = !getenv("RX_VK_SYNC_CAPTURE") || atoi(getenv("RX_VK_SYNC_CAPTURE")) != 0;
-        if (capture) memory_capture_submit();
+        if (capture) memory_capture_submit(false);
         // (RX_VK_SUBMIT_DELAY_US=<us> (a test): a console's GPU starts later than this replay does. Does what a submission reads
         // arrive just after it, from the game's other threads?)
         static const int delay_us = getenv("RX_VK_SUBMIT_DELAY_US") ? atoi(getenv("RX_VK_SUBMIT_DELAY_US")) : 0;
@@ -4401,7 +4403,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
         return do_submit(handles, n);
     }
     std::lock_guard lk(submit_order_mu);
-    memory_capture_submit();   // (the pages as they are now, on the game's thread: vk_memory.cpp)
+    memory_capture_submit(false);   // (the pages as they are now, on the game's thread: vk_memory.cpp)
     Job j{JOB_SUBMIT};
     j.handles.assign(handles, handles + std::max(n, 0));
     j.queue = queue;
