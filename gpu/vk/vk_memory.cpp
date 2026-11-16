@@ -1570,17 +1570,17 @@ void memory_note_ui_buffer(uint64_t gpu, uint64_t size) {
         logf("vk: capture: a 2D draw's buffer at %#llx (%llu bytes): %zu ranges, %llu KB taken at each submit", (unsigned long long)guest,
              (unsigned long long)size, ui_cap_ranges.size(), (unsigned long long)(total >> 10));
 }
-std::unique_ptr<Capture> capture_make();
+std::unique_ptr<Capture> capture_make(bool wait_late_on_submitter);
 void shadow_written(const uint32_t* pages, int64_t n);   // (the write-back's diff, below: pages the CPU wrote)
 void shadow_free(Pool& p);
-void memory_capture_submit() {
-    std::unique_ptr<Capture> c = capture_make();
+void memory_capture_submit(bool wait_late_on_submitter) {
+    std::unique_ptr<Capture> c = capture_make(wait_late_on_submitter);
     if (!c) return;
     std::lock_guard lk(cap_mu);
     captures.push_back(std::move(c));
 }
 /// (the pages the CPU wrote since the last capture, copied now: a submit's capture, or memory_capture_now's)
-std::unique_ptr<Capture> capture_make() {
+std::unique_ptr<Capture> capture_make(bool wait_late_on_submitter) {
     if (!capture_on()) return nullptr;
     const auto t0 = std::chrono::steady_clock::now();
     std::unique_ptr<Capture> c;
@@ -1660,11 +1660,21 @@ std::unique_ptr<Capture> capture_make() {
     // 0 and fills in the rest. The CPU runs a frame ahead, and a copy taken before the write-back had landed had the GPU's
     // words from the frame before; the mirror sync of the page put them back over the GPU's newer ones, and the exposure
     // stepped for a frame (one-frame flashes, 40-120 a minute in Kokiri Forest). Only the copies of such pages wait, for the
-    // last submission writing them back: not every frame's present. That wait held the game's thread (~8% of its time at a
-// ~2150-draw scene), so those pages are copied again by the replay, before it uses this capture, once the submission is
-// done: the replay waits instead, while the game goes on. RX_VK_CAPTURE_WAIT=1: the game's thread waits, 0: no wait
+    // last submission writing them back: not every frame's present. Ordinarily those pages are copied again by the replay,
+    // before it uses this capture, once the submission is done. When replay itself is deferred, however, the original caller
+    // can rewrite the page while that worker waits; `wait_late_on_submitter` keeps the wait and second copy on the caller then.
+    // RX_VK_CAPTURE_WAIT explicitly selects 1 (the submitter), 2 (the replay) or 0 (no wait) for every path.
     if (n > 0) {
-        static const int cap_wait = getenv("RX_VK_CAPTURE_WAIT") ? atoi(getenv("RX_VK_CAPTURE_WAIT")) : 2;
+        static const bool cap_wait_set = getenv("RX_VK_CAPTURE_WAIT") != nullptr;
+        static const int cap_wait_value = cap_wait_set ? atoi(getenv("RX_VK_CAPTURE_WAIT")) : 0;
+        const int cap_wait = cap_wait_set ? cap_wait_value : wait_late_on_submitter ? 1 : 2;
+        if (!cap_wait_set && wait_late_on_submitter) {
+            static std::once_flag told;
+            std::call_once(told, [] {
+                logf("vk: deferred replay keeps captures' late-page waits on the submitting thread "
+                     "(RX_VK_CAPTURE_WAIT=2: wait on the replay worker as before)");
+            });
+        }
         uint64_t v = 0;
         // (relink, 10/11 10:40) RX_VK_CAPTURE_LATE_ONLY=<guest page address, hex>,...: only those pages wait; RX_VK_LOG_LATE=1:
         // which pages are late, every 600 captures with one. The wait is what stops the exposure's steps (without it, the
@@ -2225,7 +2235,7 @@ bool memory_take_capture(uint64_t value, uint64_t completed) {
 /// (vk_replay.cpp resume_queue): the CPU's writes up to that signal, which the console's GPU reads after its wait
 bool memory_capture_now(uint64_t value, uint64_t completed) {
     if (completed > mem_completed) mem_completed = completed;
-    std::unique_ptr<Capture> c = capture_make();
+    std::unique_ptr<Capture> c = capture_make(false);
     return c && take_capture(std::move(c), value, completed);
 }
 

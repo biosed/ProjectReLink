@@ -174,8 +174,10 @@ void memory_import_stats(int64_t* imports, int64_t* import_ns, int64_t* bg_waits
 // may be read from (storage buffers, buffer copies) are stamped the same way.
 void memory_collect_written();
 /// RX_VK_CAPTURE (on with the mirrors; =0 off): at a submit, on the submitting thread, the pages the CPU wrote since the
-/// last one, and a copy of them as they are then; the replay stamps them and fills the mirrors from that copy
-void memory_capture_submit();
+/// last one, and a copy of them as they are then; the replay stamps them and fills the mirrors from that copy.
+/// `wait_late_on_submitter` keeps the late-page wait on that thread when replay itself is deferred: otherwise the game can
+/// rewrite an exposure page while the replay worker waits to copy it again. An explicit RX_VK_CAPTURE_WAIT still wins.
+void memory_capture_submit(bool wait_late_on_submitter);
 /// The replay of the next submit: its capture (false: none, the pages are collected now as before)
 bool memory_take_capture(uint64_t value, uint64_t completed);
 bool memory_capture_now(uint64_t value, uint64_t completed);   // (relink: made and taken at once)
