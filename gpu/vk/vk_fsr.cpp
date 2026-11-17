@@ -214,9 +214,9 @@ FsrContext* fsr_create(uint32_t max_render_w, uint32_t max_render_h, uint32_t ou
     c->backend.vkDeviceProcAddr = vkGetDeviceProcAddr;
     c->desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     c->desc.header.pNext = &c->backend.header;
-    // (the colour vk_dlss.cpp gives is the game's tonemapped LDR colour: no HDR, no auto-exposure (FFX then takes an
-    // exposure of 1). Its depth is not reversed (0 near, 1 far: dlss_prep.comp writes the depth buffer as it is). Its motion
-    // vectors are at the render size and without the jitter (dlss_prep.comp takes it off): neither flag)
+    // (the colour vk_dlss.cpp gives is the game's tonemapped linear LDR colour: no HDR, no auto-exposure (FFX then takes
+    // an exposure of 1). Its depth is not reversed (0 near, 1 far: dlss_prep.comp writes the depth buffer as it is). Its
+    // motion vectors are at the render size and without the jitter (dlss_prep.comp takes it off): neither flag)
     static const bool debug = env_on("RX_VK_FSR_DEBUG");
     c->desc.flags = (flags & FSR_DEPTH_INFINITE ? FFX_UPSCALE_ENABLE_DEPTH_INFINITE : 0u) |
                     (flags & FSR_DYNAMIC ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0u) |
@@ -297,7 +297,7 @@ uint32_t fsr_dispatch(FsrContext* c, VkCommandBuffer cmd, const FsrFrame& f) {
     d.reset = f.reset;
     d.cameraNear = f.near_z, d.cameraFar = f.far_z, d.cameraFovAngleVertical = f.fov_y;
     d.viewSpaceToMetersFactor = f.meters;
-    d.flags = f.perceptual ? FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB : 0u;
+    d.flags = 0;   // (vk_dlss.cpp converts the game's perceptual network input to the linear colour FSR 3.1 requires)
     return api.dispatch(&c->ctx, &d.header);
 }
 
