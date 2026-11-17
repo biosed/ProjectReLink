@@ -25,7 +25,10 @@ inline bool should_snapshot(Mode selected, bool direct) {
 // updates, burst submits and synchronous CPU fallbacks. `capture_view` changes
 // when submitted-memory captures or page stamps change. Either makes the same
 // guest range take another copy.
-template <class Buffer, size_t Capacity = 1024>
+// Dense scene construction exceeds 1,024 distinct ranges in one epoch. The
+// entry is 40 bytes with an integer Vulkan handle, so 4,096 entries stay a
+// small, fixed allocation while avoiding correctness-preserving repeat copies.
+template <class Buffer, size_t Capacity = 4096>
 class Cache {
     static_assert(Capacity && !(Capacity & (Capacity - 1)), "Capacity must be a power of two");
 
