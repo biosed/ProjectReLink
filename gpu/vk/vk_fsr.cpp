@@ -8,10 +8,14 @@
 // The log's start says which, in one line.
 // RX_VK_FSR=0: the runtime not loaded, FSR not offered. RX_VK_FSR_DEBUG=1: the runtime checks what it is given (FFX's debug
 // checking), its messages in our log.
+// RX_VK_FSR_SHARPNESS=<0..1>: FFX's RCAS after reconstruction, before the HUD; off when unset or 0. The menu's Sharpness
+// is a separate final-picture pass which also sharpens the HUD.
 #include "vk_fsr.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -38,6 +42,17 @@ namespace {
 std::atomic<int> g_why{FSR_NOT_STARTED};
 std::string g_version;
 }  // namespace
+
+float fsr_rcas_sharpness() {
+    static const float value = [] {
+        const char* e = getenv("RX_VK_FSR_SHARPNESS");
+        if (!e || !*e) return 0.0f;
+        char* end = nullptr;
+        const float v = strtof(e, &end);
+        return end != e && std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+    }();
+    return value;
+}
 
 // (acquire: fsr_start's thread writes the entry points and g_version before it stores FSR_OK)
 FsrWhy fsr_why() { return (FsrWhy)g_why.load(std::memory_order_acquire); }
@@ -290,8 +305,13 @@ uint32_t fsr_dispatch(FsrContext* c, VkCommandBuffer cmd, const FsrFrame& f) {
     d.motionVectorScale = {f.motion_scale[0], f.motion_scale[1]};
     d.renderSize = {f.render_w, f.render_h};
     d.upscaleSize = {f.out_w, f.out_h};
-    d.enableSharpening = false;   // (the game's own Sharpness row sharpens the finished picture)
-    d.sharpness = 0.0f;
+    // (normally the game's Sharpness row acts on the finished picture, including the HUD.  An explicit FSR value uses
+    // FFX's own RCAS here instead, while this image is still the 3D alone)
+    d.sharpness = fsr_rcas_sharpness();
+    d.enableSharpening = d.sharpness > 0.0f;
+    static std::atomic<bool> told_sharpness{false};
+    if (d.enableSharpening && !told_sharpness.exchange(true))
+        logf("vk: AMD FSR: RCAS sharpens the 3D before the HUD at %.0f%% (RX_VK_FSR_SHARPNESS)", d.sharpness * 100.0f);
     d.frameTimeDelta = f.frame_ms;
     d.preExposure = 1.0f;
     d.reset = f.reset;
