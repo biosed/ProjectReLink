@@ -114,17 +114,25 @@ thread_local bool compute_now = false;
 // ---- (relink) RX_VK_PROF_FINE=1: where a draw's time goes, finer than the frame line's phases, and what each draw does ----
 // Off, each site is a test of one constant. On, a timed site reads the clock twice (~15 ns; the frame line's phases grow by the same, so
 // compare a run with it on to another with it on) and the sums are logged with the frame statistics, "a frame (fine)": the times in ms a
-// frame, the counts a draw. FT_*: the sections of the descriptor build (banks, c1, user uniform buffers, storage buffers, textures) and
-// of the commands (hazards and the pass, pipeline bind, descriptor push, push constants, dynamic state, vertex and index binds, the draw)
-enum FineT { FT_BANK, FT_C1, FT_UBO, FT_STORAGE, FT_TEX, FT_HAZARD, FT_BINDPL, FT_BINDDESC, FT_PUSHCALL, FT_PUSHC, FT_DYN, FT_VERTEX,
-             FT_DRAWCALL, FT_COUNT };
-const char* const kFineT[] = {"banks", "c1", "user uniform buffers", "storage buffers", "textures", "hazards+pass", "bind pipeline",
-                                      "bind descriptors", "of it the push call", "push constants", "dynamic state", "vertex+index binds",
-                                      "draw call"};
+// frame, the counts a draw. FT_*: total preparation, descriptor and command phases, plus the sections of the descriptor build
+// (banks, c1, user uniform buffers, storage buffers, textures) and of the commands (hazards and the pass, pipeline bind,
+// descriptor push, push constants, dynamic state, vertex and index binds, the draw). A total minus its named sections exposes
+// loop, lookup and diagnostic overhead that was previously outside every fine timer.
+enum FineT { FT_PREP, FT_TARGETS, FT_PROGRAM_PICK, FT_PIPE_LOOKUP, FT_DESC_TOTAL, FT_BANK, FT_C1, FT_UBO, FT_STORAGE, FT_TEX,
+             FT_CMD_TOTAL, FT_HAZARD, FT_CMD_PREPASS, FT_CMD_TRACK, FT_BINDPL, FT_BINDDESC, FT_PUSHCALL, FT_PUSHC, FT_DYN,
+             FT_CMD_POSTSTATE, FT_MESH_DRAW, FT_MESH_COUNT_BIND, FT_MESH_ARGS_BIND, FT_MESH_PUSH, FT_MESH_CALL, FT_VERTEX, FT_DRAWCALL,
+             FT_COUNT };
+const char* const kFineT[] = {"draw preparation", "targets+types", "program pick", "pipeline lookup", "descriptor total", "banks",
+                                      "c1", "user uniform buffers", "storage buffers", "textures", "command total", "hazards+pass",
+                                      "command pre-pass", "sampled-target tracking", "bind pipeline", "bind descriptors",
+                                      "of it the push call", "push constants", "dynamic state", "post-state setup",
+                                      "mesh draw setup+call", "mesh count bind", "mesh arguments bind", "mesh first push", "mesh command",
+                                      "vertex+index binds", "draw call"};
 enum FineC { FC_DRAWS, FC_BUILDS, FC_DESCS, FC_WRITES, FC_BANK_CALLS, FC_BANK_GEN, FC_BANK_FILLS, FC_BANK_FILL_BYTES, FC_BANK_SAME,
              FC_BANK_NEW, FC_BANK_NEW_BYTES, FC_C1_CALLS, FC_UBO_CALLS, FC_UBO_OVERLAY, FC_UBO_STREAM, FC_UBO_REUSE, FC_PUSH_FULL,
              FC_PUSH_DELTA, FC_PUSH_NONE, FC_PUSH_WRITES, FC_PUSH_DESCS, FC_BIND_PIPE, FC_DYN_FAST, FC_DYN_FULL, FC_DYN_CALLS,
-             FC_VBIND, FC_IBIND, FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_COUNT };
+             FC_VBIND, FC_IBIND, FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_MESH_DRAWS,
+             FC_MESH_INDIRECT, FC_MESH_COUNTED, FC_MESH_FIRST, FC_COUNT };
 const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "descriptor writes", "bank calls",
                                       "bank kept by its stage's generation", "bank fills", "bank bytes filled", "bank refills equal",
                                       "bank copies into the stream", "bank bytes copied", "c1 calls", "user uniform buffer calls",
@@ -134,7 +142,8 @@ const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "desc
                                       "writes pushed", "descriptors pushed", "pipeline binds", "dynamic state from the draw before",
                                       "dynamic state worked out", "dynamic state commands", "vertex stream binds", "index buffer binds",
                                       "push constants", "pipeline keys from the fast pair", "pipeline keys from the thread's map",
-                                      "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built"};
+                                      "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built",
+                                      "mesh draws", "indirect mesh draws", "counted mesh draws", "mesh draws with a nonzero first task"};
 static_assert(std::size(kFineT) == FT_COUNT && std::size(kFineC) == FC_COUNT, "every section and count is named");
 const bool g_fine = getenv("RX_VK_PROF_FINE") != nullptr;
 int64_t fine_ns[FT_COUNT], fine_n[FC_COUNT];
@@ -142,7 +151,10 @@ struct FineScope {
     int ph;
     int64_t t0;
     explicit FineScope(int p) : ph(p), t0(g_fine ? prof_now() : 0) {}
-    ~FineScope() { if (g_fine) fine_ns[ph] += prof_now() - t0; }
+    void finish() {
+        if (g_fine && t0) fine_ns[ph] += prof_now() - t0, t0 = 0;
+    }
+    ~FineScope() { finish(); }
     FineScope(const FineScope&) = delete;
     FineScope& operator=(const FineScope&) = delete;
 };
@@ -6077,6 +6089,8 @@ void tex_of_note(const NvnState& s, const Program& p, const Targets* at, const N
 }
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    FineScope fine_prep(FT_PREP);
+    FineScope fine_targets(FT_TARGETS);
     Pass& ps = pass();   // One TLS accessor for this recording thread's pass state.
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
@@ -6112,7 +6126,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         }
     }
     const Program* cp;
+    fine_targets.finish();
     {
+        FINE_SCOPE(FT_PROGRAM_PICK);
         PROF_HOT(PROF_PROGRAM);
         ParLock lk(d.mesh);   // (graphics programs: each thread's picks, program_pick's own lock)
         program_load_async_here(true);   // (relink: a cached program's read goes to the workers: vk_shader.cpp)
@@ -6328,6 +6344,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (p.fallback) topo = p.fallback_topology;   // (the mesh program's points, lines or triangles)
     PipeEntry* pe;
     {
+        FINE_SCOPE(FT_PIPE_LOOKUP);
         PROF_HOT(PROF_PIPE);
         if (!p.layout) {
             PROF_EXACT();
@@ -6386,7 +6403,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     static const bool no_reuse = getenv("RX_VK_NO_DESC_REUSE") != nullptr;   // (A/B: every draw builds its own)
     const bool same_desc = !no_reuse && last_desc_valid && last_desc_prog == &p && last_desc_bind == s.bind_gen &&
                            last_desc_reg == reg_gen && last_desc_ub == ub_gen;
+    fine_prep.finish();
     if (!same_desc) {
+        FINE_SCOPE(FT_DESC_TOTAL);
         PROF_HOT(PROF_DESC);
         FINE_N(FC_BUILDS, 1);
         trace_tex_hit = nullptr, trace_tex_mask = 0;
@@ -6412,6 +6431,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (dump_on()) log_dump_draw(s, p, d);
     PROF_HOT(PROF_CMDS);
+    FINE_SCOPE(FT_CMD_TOTAL);
     texture_watch_prog(p.key);
     if (!same_desc) gfx_sampled() = draw_sampled(), light_probe_draw = light_probe_now;
     static const bool barrier_every = getenv("RX_VK_BARRIER_EVERY_DRAW") != nullptr;   // (an experiment: a pass each)
@@ -6421,6 +6441,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_HAZARD);
         writes = draw_hazards(cmd, p, s, at);
     }
+    FineScope fine_prepass(FT_CMD_PREPASS);
     static const bool log_self = getenv("RX_VK_LOG_SELF_SAMPLE") != nullptr;   // (relink, diagnosis: a draw sampling its own target)
     if (log_self && log_img_wanted(p.key)) {   // (and RX_VK_LOG_IMG's programs: their targets, at each new pairing)
         static std::mutex mu2;
@@ -6524,6 +6545,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (peek_prog(p.key)) peek_draw(cmd, p.key);   // (relink: RX_VK_PEEK_PROG)
     if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) SKIP_HERE();
+    fine_prepass.finish();
     {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
@@ -6543,6 +6565,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     probe_draw(s, p, ps.draws);   // (relink: RX_VK_PROBE)
     gprof_run(cmd, p.key);   // (RX_VK_PASS_TIMING=2)
+    FineScope fine_track(FT_CMD_TRACK);
     ps.prog = p.key;
     if (!ps.first_prog) ps.first_prog = p.key;
     for (const Texture* t : gfx_sampled()) {
@@ -6555,6 +6578,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (slot >= 0) ps.sampled_targets |= (uint16_t)(1u << slot);
     }
     ps.written |= writes;
+    fine_track.finish();
     if (pl != last_pipeline) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
@@ -6593,6 +6617,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_DYN);
         dynamic_state(cmd, s, at, topo, d.mesh && !p.fallback);
     }
+    FineScope fine_poststate(FT_CMD_POSTSTATE);
     if (trace_tex_hit && texture_frame_no() % 30 == 0) {
         static std::atomic<int> told{0};
         if (told++ < 600) {
@@ -6644,7 +6669,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         static const bool gpu_dump_on = getenv("RX_VK_GPU_DUMP") != nullptr;
         if (stats_query.cmd && gpu_dump_on) stats_query.state = &s, stats_query.prog = p.key;
     }
+    fine_poststate.finish();
     if (d.mesh) {
+        FINE_SCOPE(FT_MESH_DRAW);
+        FINE_N(FC_MESH_DRAWS, 1);
+        FINE_N(FC_MESH_INDIRECT, d.indirect != 0);
+        FINE_N(FC_MESH_COUNTED, d.count_addr != 0);
+        FINE_N(FC_MESH_FIRST, d.first_task != 0);
         if (p.fallback) {   // (relink: the generated vertex stage reads the records; one vertex a corner)
             if (fallback_vertex_count) vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);
             st_mesh++;
@@ -6748,32 +6779,45 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             }
         }
         if (d.indirect) {
-            BufferRef cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
+            BufferRef cnt;
+            {
+                FINE_SCOPE(FT_MESH_COUNT_BIND);
+                cnt = d.count_addr ? gpu_buffer_bind(d.count_addr, 4, false) : BufferRef{};
+            }
             if (mesh_conv_buf) {   // (EvilOOT: the records as {count, 1, 1}, mesh_indirect_convert)
-                if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
-                    vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_conv_buf, mesh_conv_off, cnt.buffer, cnt.offset, d.max, 12);
-                else
-                    vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, std::max(d.max, 1), 12);
+                {
+                    FINE_SCOPE(FT_MESH_CALL);
+                    if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
+                        vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_conv_buf, mesh_conv_off, cnt.buffer, cnt.offset, d.max, 12);
+                    else
+                        vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_conv_buf, mesh_conv_off, std::max(d.max, 1), 12);
+                }
                 mesh_conv_buf = VK_NULL_HANDLE;
                 st_mesh++;
                 st_draws++, ps.draws++;
                 return;
             }
             if (!mesh_args.buffer) {
+                FINE_SCOPE(FT_MESH_ARGS_BIND);
                 mesh_args = gpu_buffer_bind(d.indirect, (uint64_t)std::max(d.max, 1) * std::max(d.stride, 12), false);
                 if (!mesh_args) SKIP_HERE();
             }
             const uint32_t step = mesh_args.buffer == mesh_args_buffer && mesh_args_buffer ? 16u : (uint32_t)std::max(d.stride, 12);
             if (mesh_args.buffer == mesh_args_buffer && mesh_args_buffer) {   // (the task programs' firsts: this draw's entries)
+                FINE_SCOPE(FT_MESH_PUSH);
                 const uint64_t firsts = mesh_args_address + mesh_args.offset + 12;
                 vkCmdPushConstants(cmd, p.layout, p.push_stages, Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, 8, &firsts);
             }
-            if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
-                vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_args.buffer, mesh_args.offset, cnt.buffer, cnt.offset, d.max, step);
-            else
-                vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_args.buffer, mesh_args.offset, (uint32_t)std::max(d.max, 1), step);
+            {
+                FINE_SCOPE(FT_MESH_CALL);
+                if (cnt && vkCmdDrawMeshTasksIndirectCountEXT)
+                    vkCmdDrawMeshTasksIndirectCountEXT(cmd, mesh_args.buffer, mesh_args.offset, cnt.buffer, cnt.offset, d.max, step);
+                else
+                    vkCmdDrawMeshTasksIndirectEXT(cmd, mesh_args.buffer, mesh_args.offset, (uint32_t)std::max(d.max, 1), step);
+            }
         } else {
             if (mesh_args_ready()) {   // (a direct draw's first: in an entry of its own, or entry 0's 0)
+                FINE_SCOPE(FT_MESH_PUSH);
                 uint32_t at = 0;
                 if (d.first_task) {
                     at = mesh_args_take(1);
@@ -6782,8 +6826,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 const uint64_t firsts = mesh_args_address + (uint64_t)at * 16 + 12;
                 vkCmdPushConstants(cmd, p.layout, p.push_stages, Shader::Backend::SPIRV::MESH_FIRST_PUSH_OFFSET, 8, &firsts);
             }
-            vkCmdDrawMeshTasksEXT(cmd, (uint32_t)std::max(d.groups[0], 0), (uint32_t)std::max(d.groups[1], 1),
-                                  (uint32_t)std::max(d.groups[2], 1));
+            {
+                FINE_SCOPE(FT_MESH_CALL);
+                vkCmdDrawMeshTasksEXT(cmd, (uint32_t)std::max(d.groups[0], 0), (uint32_t)std::max(d.groups[1], 1),
+                                      (uint32_t)std::max(d.groups[2], 1));
+            }
         }
         st_mesh++;
         st_draws++, ps.draws++;
