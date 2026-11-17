@@ -91,6 +91,9 @@ struct BufferRef {
     VkBuffer buffer = VK_NULL_HANDLE;
     uint64_t offset = 0, size = 0;
     VkDeviceAddress address = 0;
+    // The binding aliases CPU-writable guest memory. Unlike a VRAM mirror, its
+    // bytes can change after command recording and before the GPU reads them.
+    bool direct = false;
     explicit operator bool() const {
         return buffer != VK_NULL_HANDLE;
     }
