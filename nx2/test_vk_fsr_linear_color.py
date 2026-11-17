@@ -44,8 +44,19 @@ def main() -> None:
     fsr = (ROOT / "gpu" / "vk" / "vk_fsr.cpp").read_text(encoding="utf-8")
     dispatch = function(fsr, "uint32_t fsr_dispatch(")
     assert "d.flags = 0" in dispatch
+    assert 'getenv("RX_VK_FSR_SHARPNESS")' in fsr
+    assert "d.sharpness = fsr_rcas_sharpness()" in dispatch
+    assert "d.enableSharpening = d.sharpness > 0.0f" in dispatch
     assert "FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB" not in dispatch
     assert "perceptual" not in (ROOT / "gpu" / "vk" / "vk_fsr.h").read_text(encoding="utf-8")
+
+    # FSR RCAS runs before the game draws its HUD. The later final-picture
+    # sharpening pass must not stack on top and sharpen the HUD a second time.
+    framegen = (ROOT / "gpu" / "vk" / "vk_framegen.cpp").read_text(encoding="utf-8")
+    scale = function(framegen, "VkImage framegen_scale(")
+    assert "const bool rcas = fsr_rcas_active()" in scale
+    assert "rcas ? 0.0f : opts.sharpness / 100.0f" in scale
+    assert 'rcas ? " (FSR RCAS owns the 3D)" : ""' in scale
 
     # Both paths must still produce the game's linear output: DLSS returns its
     # perceptual value and the output pass squares it; FSR receives and returns
