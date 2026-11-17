@@ -22,19 +22,29 @@ int main() {
     mkwvk::direct_ub::Cache<uintptr_t, 4> cache;
     uintptr_t buffer = 0;
     uint64_t offset = 0;
-    CHECK(!cache.find(0x1000, 64, 1, &buffer, &offset));
+    CHECK(!cache.find(0x1000, 64, 1, 10, &buffer, &offset));
     cache.reset();
-    cache.keep(0x1000, 64, 1, 7, 256);
-    CHECK(cache.find(0x1000, 64, 1, &buffer, &offset));
+    CHECK(cache.keep(0x1000, 64, 1, 10, 7, 256));
+    CHECK(cache.find(0x1000, 64, 1, 10, &buffer, &offset));
     CHECK(buffer == 7 && offset == 256);
-    CHECK(!cache.find(0x1000, 64, 2, &buffer, &offset));
-    CHECK(!cache.find(0x1000, 80, 1, &buffer, &offset));
-    CHECK(!cache.find(0x2000, 64, 1, &buffer, &offset));
+    CHECK(!cache.find(0x1000, 64, 2, 10, &buffer, &offset));
+    CHECK(!cache.find(0x1000, 64, 1, 11, &buffer, &offset));
+    CHECK(!cache.find(0x1000, 80, 1, 10, &buffer, &offset));
+    CHECK(!cache.find(0x2000, 64, 1, 10, &buffer, &offset));
 
-    cache.keep(0x1000, 64, 1, 9, 512);
-    CHECK(cache.find(0x1000, 64, 1, &buffer, &offset));
+    CHECK(cache.keep(0x1000, 64, 1, 10, 9, 512));
+    CHECK(cache.find(0x1000, 64, 1, 10, &buffer, &offset));
     CHECK(buffer == 9 && offset == 512);
     cache.reset();
-    CHECK(!cache.find(0x1000, 64, 1, &buffer, &offset));
+    CHECK(!cache.find(0x1000, 64, 1, 10, &buffer, &offset));
+
+    CHECK(cache.keep(0x1000, 64, 1, 10, 1, 16));
+    CHECK(cache.keep(0x2000, 64, 1, 10, 2, 32));
+    CHECK(cache.keep(0x3000, 64, 1, 10, 3, 48));
+    CHECK(cache.keep(0x4000, 64, 1, 10, 4, 64));
+    CHECK(cache.keep(0x3000, 64, 1, 10, 5, 80));
+    CHECK(!cache.keep(0x5000, 64, 1, 10, 6, 96));
+    CHECK(cache.find(0x3000, 64, 1, 10, &buffer, &offset));
+    CHECK(buffer == 5 && offset == 80);
     return 0;
 }

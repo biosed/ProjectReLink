@@ -27,13 +27,17 @@ def main() -> None:
 
     memory = (ROOT / "gpu" / "vk" / "vk_memory.cpp").read_text(encoding="utf-8")
     draw = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
+    replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
     internal = (ROOT / "gpu" / "vk" / "vk_internal.h").read_text(encoding="utf-8")
     assert "bool direct = false;" in internal
     assert memory.count("{p->buffer, off, size, 0, true}") == 3
     assert "should_snapshot(snapshot, b.direct)" in draw
-    assert "direct_ub_at.find(u.addr, n, generation" in draw
-    assert "direct_ub_at.keep(u.addr, n, generation" in draw
+    assert "direct_ub_at.find(u.addr, n, generation, capture_view" in draw
+    assert "direct_ub_at.keep(u.addr, n, generation, capture_view" in draw
     assert "direct_ub_at.reset();" in draw
+    assert "barrier (a burst's next submit start)\");\n        ub_gen++;" in replay
+    assert replay.count("if (wrote) ub_gen++;") == 2
+    assert "if (host->gpu_write(c0.dst, words, c0.size)) ub_gen++;" in replay
     print("direct_ub_snapshot: ok")
 
 

@@ -21,8 +21,10 @@ inline bool should_snapshot(Mode selected, bool direct) {
 }
 
 // One cache belongs to one reusable command-recording slot. reset() starts a
-// new recording without freeing its table. Uniform updates are represented by
-// `generation`, so the same guest range after an UPDATE_UB gets another copy.
+// new recording without freeing its table. `generation` changes after uniform
+// updates, burst submits and synchronous CPU fallbacks. `capture_view` changes
+// when submitted-memory captures or page stamps change. Either makes the same
+// guest range take another copy.
 template <class Buffer, size_t Capacity = 1024>
 class Cache {
     static_assert(Capacity && !(Capacity & (Capacity - 1)), "Capacity must be a power of two");
@@ -32,6 +34,7 @@ class Cache {
         uint64_t address = 0;
         uint64_t size = 0;
         uint64_t generation = 0;
+        uint64_t capture_view = 0;
         Buffer buffer{};
         uint64_t offset = 0;
     };
@@ -39,8 +42,9 @@ class Cache {
     std::vector<Entry> entries_;
     uint64_t serial_ = 0;
 
-    static size_t slot(uint64_t address, uint64_t size, uint64_t generation) {
-        uint64_t h = address ^ (size * 0x9e3779b97f4a7c15ull) ^ (generation * 0xbf58476d1ce4e5b9ull);
+    static size_t slot(uint64_t address, uint64_t size, uint64_t generation, uint64_t capture_view) {
+        uint64_t h = address ^ (size * 0x9e3779b97f4a7c15ull) ^ (generation * 0xbf58476d1ce4e5b9ull) ^
+                     (capture_view * 0x94d049bb133111ebull);
         h ^= h >> 30;
         h *= 0xbf58476d1ce4e5b9ull;
         h ^= h >> 27;
@@ -56,13 +60,16 @@ public:
         }
     }
 
-    bool find(uint64_t address, uint64_t size, uint64_t generation, Buffer* buffer, uint64_t* offset) const {
+    bool find(uint64_t address, uint64_t size, uint64_t generation, uint64_t capture_view,
+              Buffer* buffer, uint64_t* offset) const {
         if (entries_.empty() || !serial_) return false;
-        size_t at = slot(address, size, generation);
+        size_t at = slot(address, size, generation, capture_view);
         for (size_t probe = 0; probe < Capacity; probe++, at = (at + 1) & (Capacity - 1)) {
             const Entry& entry = entries_[at];
             if (entry.serial != serial_) return false;
-            if (entry.address != address || entry.size != size || entry.generation != generation) continue;
+            if (entry.address != address || entry.size != size || entry.generation != generation ||
+                entry.capture_view != capture_view)
+                continue;
             *buffer = entry.buffer;
             *offset = entry.offset;
             return true;
@@ -70,19 +77,22 @@ public:
         return false;
     }
 
-    void keep(uint64_t address, uint64_t size, uint64_t generation, Buffer buffer, uint64_t offset) {
+    bool keep(uint64_t address, uint64_t size, uint64_t generation, uint64_t capture_view,
+              Buffer buffer, uint64_t offset) {
         if (entries_.empty() || !serial_) reset();
-        size_t at = slot(address, size, generation);
+        size_t at = slot(address, size, generation, capture_view);
         for (size_t probe = 0; probe < Capacity; probe++, at = (at + 1) & (Capacity - 1)) {
             Entry& entry = entries_[at];
             if (entry.serial == serial_ &&
-                (entry.address != address || entry.size != size || entry.generation != generation))
+                (entry.address != address || entry.size != size || entry.generation != generation ||
+                 entry.capture_view != capture_view))
                 continue;
-            entry = {serial_, address, size, generation, buffer, offset};
-            return;
+            entry = {serial_, address, size, generation, capture_view, buffer, offset};
+            return true;
         }
         // A pathological recording with more unique ranges than Capacity is
         // still correct: that range is simply copied again on its next bind.
+        return false;
     }
 };
 

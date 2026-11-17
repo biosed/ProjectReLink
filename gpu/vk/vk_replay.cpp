@@ -1183,12 +1183,14 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 const uint64_t guest = host->gpu_guest(c.dst);
                 if (guest) memory_stamp_gpu(guest, c.size);
             } else {   // (outside the pools: on the CPU)
+                bool wrote = false;
                 for (uint64_t done = 0; done < c.size;) {
                     uint8_t buf[65536];
                     const uint64_t k = std::min<uint64_t>(sizeof buf, c.size - done);
                     if (!host->gpu_read(c.src + done, buf, k) || !host->gpu_write(c.dst + done, buf, k)) break;
-                    done += k;
+                    done += k, wrote = true;
                 }
+                if (wrote) ub_gen++;
             }
             full_barrier(cmd);
             break;
@@ -1203,7 +1205,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (in_stream && !worker) {
                 uint32_t words[64];
                 for (auto& w : words) w = c0.value;
-                host->gpu_write(c0.dst, words, c0.size);
+                if (host->gpu_write(c0.dst, words, c0.size)) ub_gen++;
             }
             if (dry) break;
             ParLock lk;
@@ -1230,11 +1232,13 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             } else if (!in_stream) {   // (outside the pools or unaligned: on the CPU)
                 uint32_t buf[1024];
                 for (auto& w : buf) w = c.value;
+                bool wrote = false;
                 for (uint64_t done = 0; done < c.size;) {
                     const uint64_t k = std::min<uint64_t>(sizeof buf, c.size - done);
                     if (!host->gpu_write(c.dst + done, buf, k)) break;
-                    done += k;
+                    done += k, wrote = true;
                 }
+                if (wrote) ub_gen++;
             }
             full_barrier(cmd);
             break;
@@ -2345,6 +2349,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     if (burst_open && rec_cur) {   // (the burst's recording goes on: what the piece before did, done first)
         end_pass(rec_cur->cmd);
         full_barrier(rec_cur->cmd, "barrier (a burst's next submit start)");
+        ub_gen++;   // direct guest ranges may have been rewritten between the burst's guest submits
         use_queue_state(queue);
     } else {
         const uint64_t tag = burst_open ? std::max(burst_value, value) : value;

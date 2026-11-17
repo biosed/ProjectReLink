@@ -403,8 +403,8 @@ struct RecordingRes {
     uint64_t before = 0;           // (what the recording used of the streams before this one)
     uint32_t idle = 0;             // (recordings of the slot that stayed in the first stream)
     std::unordered_map<const void*, std::pair<VkBuffer, uint64_t>> c1_at;   // (c1 of a stage: uploaded once a recording)
-    // Direct (non-mirrored) uniform ranges copied once for this recording and
-    // again only after an inline uniform update changes their generation.
+    // Direct (non-mirrored) uniform ranges copied once for each submitted-memory
+    // view and again after an inline update or another submit in this recording.
     mkwvk::direct_ub::Cache<VkBuffer> direct_ub_at;
 };
 // (a recording's first stream: one for each of the kRecordings slots. RX_VK_STREAM_MB=<n>: that size, 2 by default; a recording
@@ -2356,14 +2356,14 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         BufferRef b = snapshot == mkwvk::direct_ub::Mode::forced ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
         const bool keep_copy = mkwvk::direct_ub::should_snapshot(snapshot, b.direct);
         if (b && b.offset % align == 0 && !keep_copy) return {b.buffer, b.offset, n};
-        const uint64_t generation = ub_generation();
+        const uint64_t generation = ub_generation(), capture_view = memory_capture_view();
         if (keep_copy) {
             static std::atomic_flag told = ATOMIC_FLAG_INIT;
             if (!told.test_and_set())
                 logf("vk: direct uniform buffers copied into the recording stream (RX_VK_UB_SNAPSHOT=0: direct, 1: all)");
             VkBuffer buffer = VK_NULL_HANDLE;
             uint64_t at = 0;
-            if (cur->direct_ub_at.find(u.addr, n, generation, &buffer, &at)) {
+            if (cur->direct_ub_at.find(u.addr, n, generation, capture_view, &buffer, &at)) {
                 FINE_N(FC_UBO_REUSE, 1);
                 return {buffer, at, n};
             }
@@ -2373,7 +2373,11 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         FINE_N(FC_UBO_STREAM, 1);
         // (as the submission had it, not as the game has rewritten it since: the captures' pages)
         memory_read_as_submitted(u.addr, cur->mapped + at, n);
-        if (keep_copy) cur->direct_ub_at.keep(u.addr, n, generation, cur->stream, at);
+        if (keep_copy && !cur->direct_ub_at.keep(u.addr, n, generation, capture_view, cur->stream, at)) {
+            static std::atomic_flag full_told = ATOMIC_FLAG_INIT;
+            if (!full_told.test_and_set())
+                logf("vk: direct uniform-buffer snapshot cache full; extra bindings will be copied again");
+        }
         static int64_t copied;
         if (!keep_copy && ++copied % 5000 == 1)
             logf("vk: uniform buffer %#llx +%#llx copied into the stream (%s; %lld so)", (unsigned long long)u.addr,
