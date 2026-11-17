@@ -62,7 +62,6 @@ struct FsrFrame {
     float frame_ms = 16.7f;
     float near_z = 0, far_z = 0, fov_y = 0;   // (the camera's planes, in its units, and its vertical field of view in radians)
     float meters = 1.0f;        // (a view-space unit in metres)
-    bool perceptual = false;    // (the colour is gamma-encoded, not linear: FFX's sRGB input flag)
 };
 /// Records the upscale into cmd: 0 when done, else FFX's return code (FfxApiReturnCodes)
 uint32_t fsr_dispatch(FsrContext* c, VkCommandBuffer cmd, const FsrFrame& f);
