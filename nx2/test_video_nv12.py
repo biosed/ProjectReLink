@@ -21,11 +21,10 @@ def main() -> None:
     start = source.index("static void queue_frame(")
     end = source.index("static void mf_picture(", start)
     queue_frame = source[start:end]
-    assert "const int planar_420 = f->format == AV_PIX_FMT_YUV420P" in queue_frame
-    assert "const int lazy_rgba = nv12 || planar_420" in queue_frame
+    assert "f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P" in queue_frame
+    assert "const int lazy_rgba = nv12 || f->format == AV_PIX_FMT_YUV420P" in queue_frame
     assert "p.rgba = lazy_rgba ? NULL" in queue_frame
     assert "video_yuv420p_to_nv12" in queue_frame
-    assert "AV_PIX_FMT_YUVA420P" not in queue_frame
 
     # Decoder pools currently hold each acquired picture at index zero. The
     # existing lazy conversion deliberately follows that same ownership rule.

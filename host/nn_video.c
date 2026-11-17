@@ -312,8 +312,8 @@ static void queue_frame(Dec *d, const AVFrame *f) {
        existing pool_rgba() path do the expensive conversion only if a caller
        later asks for RGBA. Formats with alpha or greater precision retain the
        old eager conversion. */
-    const int planar_420 = f->format == AV_PIX_FMT_YUV420P;
-    const int lazy_rgba = nv12 || planar_420;
+    const int planar_420 = f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P;
+    const int lazy_rgba = nv12 || f->format == AV_PIX_FMT_YUV420P;
     if (!lazy_rgba && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
         if (d->sws) sws_freeContext(d->sws);
         d->sws = sws_getContext(w, h, (enum AVPixelFormat)f->format, w, h, AV_PIX_FMT_RGBA, SWS_BILINEAR, NULL, NULL, NULL);
