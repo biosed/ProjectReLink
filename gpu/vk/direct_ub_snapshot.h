@@ -33,18 +33,17 @@ class Cache {
         uint64_t serial = 0;
         uint64_t address = 0;
         uint64_t size = 0;
-        uint64_t generation = 0;
-        uint64_t capture_view = 0;
         Buffer buffer{};
         uint64_t offset = 0;
     };
 
     std::vector<Entry> entries_;
     uint64_t serial_ = 0;
+    uint64_t generation_ = ~0ull;
+    uint64_t capture_view_ = ~0ull;
 
-    static size_t slot(uint64_t address, uint64_t size, uint64_t generation, uint64_t capture_view) {
-        uint64_t h = address ^ (size * 0x9e3779b97f4a7c15ull) ^ (generation * 0xbf58476d1ce4e5b9ull) ^
-                     (capture_view * 0x94d049bb133111ebull);
+    static size_t slot(uint64_t address, uint64_t size) {
+        uint64_t h = address ^ (size * 0x9e3779b97f4a7c15ull);
         h ^= h >> 30;
         h *= 0xbf58476d1ce4e5b9ull;
         h ^= h >> 27;
@@ -62,14 +61,12 @@ public:
 
     bool find(uint64_t address, uint64_t size, uint64_t generation, uint64_t capture_view,
               Buffer* buffer, uint64_t* offset) const {
-        if (entries_.empty() || !serial_) return false;
-        size_t at = slot(address, size, generation, capture_view);
+        if (entries_.empty() || !serial_ || generation != generation_ || capture_view != capture_view_) return false;
+        size_t at = slot(address, size);
         for (size_t probe = 0; probe < Capacity; probe++, at = (at + 1) & (Capacity - 1)) {
             const Entry& entry = entries_[at];
             if (entry.serial != serial_) return false;
-            if (entry.address != address || entry.size != size || entry.generation != generation ||
-                entry.capture_view != capture_view)
-                continue;
+            if (entry.address != address || entry.size != size) continue;
             *buffer = entry.buffer;
             *offset = entry.offset;
             return true;
@@ -80,14 +77,18 @@ public:
     bool keep(uint64_t address, uint64_t size, uint64_t generation, uint64_t capture_view,
               Buffer buffer, uint64_t offset) {
         if (entries_.empty() || !serial_) reset();
-        size_t at = slot(address, size, generation, capture_view);
+        // Both values are monotonic. Once either advances, no old entry can
+        // ever match again, so reclaim the whole table in O(1).
+        if (generation != generation_ || capture_view != capture_view_) {
+            generation_ = generation;
+            capture_view_ = capture_view;
+            reset();
+        }
+        size_t at = slot(address, size);
         for (size_t probe = 0; probe < Capacity; probe++, at = (at + 1) & (Capacity - 1)) {
             Entry& entry = entries_[at];
-            if (entry.serial == serial_ &&
-                (entry.address != address || entry.size != size || entry.generation != generation ||
-                 entry.capture_view != capture_view))
-                continue;
-            entry = {serial_, address, size, generation, capture_view, buffer, offset};
+            if (entry.serial == serial_ && (entry.address != address || entry.size != size)) continue;
+            entry = {serial_, address, size, buffer, offset};
             return true;
         }
         // A pathological recording with more unique ranges than Capacity is

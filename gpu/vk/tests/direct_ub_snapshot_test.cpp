@@ -46,5 +46,14 @@ int main() {
     CHECK(!cache.keep(0x5000, 64, 1, 10, 6, 96));
     CHECK(cache.find(0x3000, 64, 1, 10, &buffer, &offset));
     CHECK(buffer == 5 && offset == 80);
+
+    // A new generation or submitted-memory view makes every old entry dead.
+    // Reclaiming them must let the fixed-capacity cache accept new ranges.
+    CHECK(cache.keep(0x5000, 64, 2, 10, 6, 96));
+    CHECK(!cache.find(0x3000, 64, 1, 10, &buffer, &offset));
+    CHECK(cache.find(0x5000, 64, 2, 10, &buffer, &offset));
+    CHECK(cache.keep(0x6000, 64, 2, 11, 7, 112));
+    CHECK(!cache.find(0x5000, 64, 2, 10, &buffer, &offset));
+    CHECK(cache.find(0x6000, 64, 2, 11, &buffer, &offset));
     return 0;
 }
