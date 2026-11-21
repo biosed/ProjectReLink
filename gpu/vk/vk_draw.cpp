@@ -7448,7 +7448,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // out past the frame's 8 ms, every program the frame needs is asked for at once and the six workers build them side by side;
     // the draws come in as theirs are ready. A pass with no depth target (post-processing, the 2D of the HUD, blits: the ones whose
     // absence was a white or black picture) still waits without bound: RX_VK_PIPE_WAIT_FLAT=1 bounds those too, as before 01:20)
-    static const int wait_ms = getenv("RX_VK_PIPE_WAIT_MS") ? std::max(0, atoi(getenv("RX_VK_PIPE_WAIT_MS"))) : 8;
+    // (relink, PR #140, issues 29 and 54: 2 ms, not 8, reducing camera-turn pipeline stutter while keeping RX_VK_PIPE_WAIT_MS overrideable)
+    static const int wait_ms = getenv("RX_VK_PIPE_WAIT_MS") ? std::max(0, atoi(getenv("RX_VK_PIPE_WAIT_MS"))) : 2;
     static const bool wait_flat = getenv("RX_VK_PIPE_WAIT_FLAT") != nullptr;
     const bool bounded = wait_ms > 0 && persistent && (at.depth || wait_flat);
     static thread_local uint64_t wait_frame = ~0ull;
