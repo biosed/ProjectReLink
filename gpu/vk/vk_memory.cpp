@@ -2375,18 +2375,21 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         // 191 / 169 -> 219 / 225 ms). RX_VK_CAPTURE_WAIT_ADAPT=0: the fixed cap, as in 0.7.4
         static const bool adapt = !getenv("RX_VK_CAPTURE_WAIT_ADAPT") || atoi(getenv("RX_VK_CAPTURE_WAIT_ADAPT")) != 0;
         static std::atomic<int64_t> p90_us{(int64_t)wait_max_ms * 500};
+        uint32_t wait_cap_ms = 250;   // vk_timeline_wait below has the same legacy cap
+        bool wait_done = true;
         if (wait_max_ms > 0) {
             static std::atomic<int64_t> st_waits{0}, st_cut{0};
             const int64_t p90 = p90_us.load(std::memory_order_relaxed);
             static const int64_t k = getenv("RX_VK_CAPTURE_WAIT_K") ? std::clamp(atoi(getenv("RX_VK_CAPTURE_WAIT_K")), 1, 16) : 4;
             const int cap_ms = adapt ? (int)std::clamp<int64_t>(k * p90 / 1000, wait_max_ms, std::max(wait_max_ms, 250)) : wait_max_ms;
+            wait_cap_ms = (uint32_t)cap_ms;
             const bool must_wait = adapt && !late_done();
             const auto c0 = std::chrono::steady_clock::now();
-            const bool done = late_wait_ms((uint32_t)cap_ms);
+            wait_done = late_wait_ms(wait_cap_ms);
             if (must_wait) {
-                const int64_t took = done ? std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - c0).count()
-                                          : (int64_t)cap_ms * 1000;
-                if (!done) p90_us.fetch_add(2000, std::memory_order_relaxed);
+                const int64_t took = wait_done ? std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - c0).count()
+                                               : (int64_t)cap_ms * 1000;
+                if (!wait_done) p90_us.fetch_add(2000, std::memory_order_relaxed);
                 else if (took > p90) p90_us.fetch_add(900, std::memory_order_relaxed);
                 else if (p90_us.fetch_sub(100, std::memory_order_relaxed) < 100) p90_us.store(0, std::memory_order_relaxed);
                 static std::atomic<bool> told{false};   // (once: a card slower than the cap, for the players' logs)
@@ -2394,13 +2397,14 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                     logf("vk: captures' waits for late pages: the cap follows a slower GPU, now %d ms (RX_VK_CAPTURE_WAIT_MAX_MS %d)",
                          cap_ms, wait_max_ms);
             }
-            st_cut += !done;
+            st_cut += !wait_done;
             if (++st_waits % 1200 == 0)
                 logf("vk: captures' waits for late pages: %lld, %lld of them cut; the cap now %d ms (RX_VK_CAPTURE_WAIT_MAX_MS %d%s, "
                      "the waits' 90th percentile %.1f ms)", (long long)st_waits.load(), (long long)st_cut.load(), cap_ms,
                      wait_max_ms, adapt ? "" : ", fixed", p90_us.load() / 1000.0);
         } else {
             vk_timeline_wait(c->late_value);
+            wait_done = late_done();
         }
         if (log_wait) {   // (each wait over 1 ms: how long, which pages; 300 lines at most)
             const double wms1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
@@ -2466,9 +2470,9 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                         snprintf(tl + tn, sizeof tl - tn, " | by value under the wait's: %d %d %d %d %d %d %d %d+; at it:%s", by[0], by[1], by[2],
                                  by[3], by[4], by[5], by[6], by[7], at);
                 }
-                logf("vk: late wait %.2f ms on %s thread (value %llu, done %llu now), %zu late pages:%s | submits (value:ms ago)%s",
-                     wms1, vk_on_present_thread() ? "the presenting" : "another", (unsigned long long)c->late_value,
-                     (unsigned long long)vk_timeline_completed(), c->late.size(), pg, tl);
+                logf("vk: late wait %.2f ms on %s thread (value %llu, done %llu now): %s with %u ms cap, %zu late pages:%s | submits "
+                     "(value:ms ago)%s", wms1, vk_on_present_thread() ? "the presenting" : "another", (unsigned long long)c->late_value,
+                     (unsigned long long)vk_timeline_completed(), wait_done ? "completed" : "CUT", wait_cap_ms, c->late.size(), pg, tl);
             }
         }
         if (log_wait) {
