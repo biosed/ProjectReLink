@@ -37,6 +37,7 @@ struct HosThread {
     int vc_held, vc_last, vc_queued, vc_escaped;
     volatile int vc_kick;
     int vc_prio_over;   /* (relink, HOS_VC_PRIO) the priority the virtual cores schedule it at, 0: its own */
+    int vc_boost;       /* (priority steps better while it has the core it took back after the replay: hos_vcore_back_first) */
     int64_t vc_since;
     /* (relink, vc_bg_cap) a background thread: until when it waits for the cores held to be few enough, and until
        when it is then left alone */
@@ -1279,7 +1280,7 @@ static unsigned vc_allowed(HosThread *t) {
     return m;
 }
 /* a runs before b */
-static int vcp(const HosThread *t) { return t->vc_prio_over ? t->vc_prio_over : t->priority; }
+static int vcp(const HosThread *t) { return (t->vc_prio_over ? t->vc_prio_over : t->priority) - t->vc_boost; }
 static int vc_better(HosThread *a, HosThread *b) {
     return vcp(a) != vcp(b) ? vcp(a) < vcp(b) : a->vc_since < b->vc_since;
 }
@@ -1512,6 +1513,7 @@ static void vc_acquire(HosThread *t) {
         if (waited > (worst ? esc_better : esc_eq)) {
             vc_dequeue(t);
             t->vc_escaped = 1;
+            t->vc_boost = 0;   /* (no core to keep a place on) */
             vc_st.escapes++;
             static int logged;
             if (logged < 40) {
@@ -1543,6 +1545,7 @@ static void vc_release(HosThread *t) {
     vc_owner[c] = NULL;
     t->vc_held = 0;
     t->vc_kick = 0;
+    t->vc_boost = 0;   /* (its place ahead ends with the core it was for: hos_vcore_back_first) */
     vc_grant(c);
     /* (relink, vc_bg_cap) fewer cores held: a background thread kept waiting by the cap may take a free core of its own
        mask now, not only this one */
@@ -1590,9 +1593,25 @@ int hos_vcore_away(void) {
     vc_release(t);
     return 1;
 }
+/* (relink, Hookshot PR #2908) After nvnQueueSubmitCommands: take a core ahead of threads up to HOS_VCORE_REPLAY_BOOST
+   priority steps better than it (2 by default; 0: as before), and keep that place until the next release. OoT's
+   Presentation Thread (priority 17) otherwise waited for a priority 16 job thread to block after each replay. */
+void hos_vcore_back_first(void) {
+    static int steps = -1;
+    if (steps < 0) steps = getenv("HOS_VCORE_REPLAY_BOOST") ? atoi(getenv("HOS_VCORE_REPLAY_BOOST")) : 2;
+    HosThread *t = cur;
+    if (!hos_vcores_on() || !t) return;
+    t->vc_escaped = 0;
+    if (t->vc_held) return;
+    t->vc_boost = steps > 0 && steps < 64 ? steps : 0;   /* (not queued, no core: no other thread reads it yet) */
+    vc_acquire(t);
+}
 void hos_vcore_back(void) {
     HosThread *t = cur;
-    if (hos_vcores_on() && t && !t->vc_held) vc_acquire(t);
+    if (hos_vcores_on() && t && !t->vc_held) {
+        t->vc_boost = 0;
+        vc_acquire(t);
+    }
 }
 void hos_vcore_checkpoint(void) {
     HosThread *t = cur;
@@ -1619,6 +1638,7 @@ int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
 int hos_vcores_on(void) { return 0; }
 int hos_vcore_away(void) { return 0; }
 void hos_vcore_back(void) {}
+void hos_vcore_back_first(void) {}
 void hos_vcore_checkpoint(void) {}
 void hos_vcore_yield(void) {}
 int hos_cv_sleep(void *cv, void *lk, unsigned ms) {
