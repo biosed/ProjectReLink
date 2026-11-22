@@ -116,6 +116,7 @@ int hos_cores(void);
 int hos_vcores_on(void);
 int hos_vcore_away(void);
 void hos_vcore_back(void);
+void hos_vcore_back_first(void);   /* (after the replay: hos_thread.c) */
 void hos_vcore_checkpoint(void);
 void hos_vcore_yield(void);
 int hos_cv_sleep(void *cv, void *srw_lock, unsigned ms);   /* SleepConditionVariableSRW (exclusive) for guest threads */
