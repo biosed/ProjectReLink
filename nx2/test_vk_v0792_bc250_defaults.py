@@ -52,6 +52,22 @@ def main() -> None:
     assert "a64_nat_fp_to_int(" in header
     assert "#define a64_fpx_nat_add32_add32 a64_fpx_hot_add32_add32" in header
 
+    shader_cpp = (ROOT / "gpu" / "vk" / "vk_shader.cpp").read_text(encoding="utf-8")
+    disk_stamp_fn = function(shader_cpp, "uint64_t disk_stamp()")
+    assert "std::sort(env_vars.begin(), env_vars.end());" in disk_stamp_fn
+    assert "add(v.data(), v.size() + 1);" in disk_stamp_fn
+
+    nvn_native = (ROOT / "host" / "nvn_native.c").read_text(encoding="utf-8")
+    submit_fn = function(nvn_native, "NV(nvnQueueSubmitCommands)")
+    assert "if (away) hos_vcore_back_first();" in submit_fn
+    vcp_fn = function(hos_thread, "static int vcp(const HosThread *t)")
+    assert "- t->vc_boost" in vcp_fn
+    back_first_fn = function(hos_thread, "void hos_vcore_back_first(void)")
+    assert "HOS_VCORE_REPLAY_BOOST" in back_first_fn
+    assert "t->vc_boost = 0;" in function(hos_thread, "static void vc_release(HosThread *t)")
+    assert "t->vc_boost = 0;" in function(hos_thread, "static void vc_acquire(HosThread *t)")
+    assert "t->vc_boost = 0;" in function(hos_thread, "void hos_vcore_back(void)")
+
     print("vk_v0792_bc250_defaults: ok")
 
 
