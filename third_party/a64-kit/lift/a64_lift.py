@@ -1894,6 +1894,7 @@ class Lifter:
         return self.override.get(pc, self.img.word(pc))
 
     def plt_target(self, e):
+        img = self.img
         try:
             w0, w1, w2, w3 = (self.word(e + 4 * i) for i in range(4))
         except Exception:

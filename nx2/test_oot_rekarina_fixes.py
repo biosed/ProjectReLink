@@ -22,9 +22,10 @@ import oot_rekarina_fixes  # noqa: E402
 
 
 class MockImg:
-    def __init__(self, words, entries=()):
+    def __init__(self, words, entries=(), mem=None):
         self.words = dict(words)
         self.entries = set(entries)
+        self.mem = dict(mem or {})
         self.hooks = {}
         self.names = {}
 
@@ -35,6 +36,9 @@ class MockImg:
         if pc not in self.words:
             raise KeyError(pc)
         return self.words[pc]
+
+    def read(self, addr, size):
+        return self.mem[addr][:size]
 
 
 def sx(val, bits):
@@ -155,17 +159,29 @@ def check_lifter_override_replace_and_locals():
         cloth_entry + 4: RET,
     }
     entries = {ring_entry, res_entry, ripple_entry, looppose_entry, turn_entry, cloth_entry, abort_entry}
+    # Include a PLT stub to ensure plt_target() exercises self.img.read() cleanly.
+    plt_entry = MAIN + 0x100
+    words.update({
+        plt_entry: 0x90000010,       # adrp x16, #0 (page = 0x80120000)
+        plt_entry + 4: 0xF9400211,   # ldr x17, [x16, #0]
+        plt_entry + 8: 0x91000210,   # add x16, x16, #0
+        plt_entry + 12: 0xD61F0220,  # br x17
+    })
+    entries.add(plt_entry)
+    plt_slot = plt_entry & ~0xFFF
+    plt_mem = {plt_slot: int(abort_entry).to_bytes(8, "little")}
 
     for local_cfg in ({"A64_LOCAL_REGS": "0", "A64_LOCAL_VREGS": "0"},
                       {"A64_LOCAL_REGS": "6", "A64_LOCAL_VREGS": "1"}):
         old_env = {k: os.environ.get(k) for k in local_cfg}
         try:
             os.environ.update(local_cfg)
-            img = MockImg(words, entries)
+            img = MockImg(words, entries, plt_mem)
             L = a64_lift.Lifter(img)
             with redirect_stdout(io.StringIO()):
                 oot_rekarina_fixes.install(L, img)
             L.discover()
+            assert plt_entry in L.plt and L.plt[plt_entry] == (abort_entry, plt_slot)
             texts = a64_lift.instruction_texts(L.funcs, set())
 
             ring_c, _ = L.emit_function(ring_entry, texts)
