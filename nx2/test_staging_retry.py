@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def check_integration() -> None:
+    internal_h = (ROOT / "gpu" / "vk" / "vk_internal.h").read_text(encoding="utf-8")
+    assert "bool vk_timeline_wait_for(uint64_t v, uint32_t ms);" in internal_h
+
     tex = (ROOT / "gpu" / "vk" / "vk_texture.cpp").read_text(encoding="utf-8")
     assert '#include "staging_retry.h"' in tex
     start = tex.index("Staging staging(uint64_t n, uint64_t align = 256)")
