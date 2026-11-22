@@ -47,7 +47,7 @@ typedef short SHORT;
 typedef unsigned short USHORT;
 typedef char CHAR;
 typedef wchar_t WCHAR;
-typedef void *HANDLE, *HMODULE, *HINSTANCE, *HWND, *HDC, *HGDIOBJ, *HBITMAP, *HFONT, *HBRUSH, *HICON, *HCURSOR, *HKEY;
+typedef void *HANDLE, *HMODULE, *HINSTANCE, *HWND, *HDC, *HGDIOBJ, *HBITMAP, *HFONT, *HBRUSH, *HICON, *HCURSOR, *HKEY, *HRGN;
 typedef void *PVOID, *LPVOID;
 typedef const void *LPCVOID;
 typedef char *LPSTR;
@@ -84,6 +84,9 @@ typedef struct { LONG cx, cy; } SIZE;
 #define LOWORD(l) ((WORD)((uintptr_t)(l) & 0xffff))
 #define HIWORD(l) ((WORD)(((uintptr_t)(l) >> 16) & 0xffff))
 #define RGB(r, g, b) ((COLORREF)(((BYTE)(r) | ((WORD)((BYTE)(g)) << 8)) | (((DWORD)(BYTE)(b)) << 16)))
+#define GetRValue(rgb) ((BYTE)((rgb) & 0xFF))
+#define GetGValue(rgb) ((BYTE)(((rgb) >> 8) & 0xFF))
+#define GetBValue(rgb) ((BYTE)(((rgb) >> 16) & 0xFF))
 #define UNREFERENCED_PARAMETER(x) ((void)(x))
 #define __declspec(x) RELINK_DECLSPEC_##x
 #define RELINK_DECLSPEC_dllexport __attribute__((visibility("default")))
@@ -513,6 +516,7 @@ static inline void *RtlVirtualUnwind(DWORD type, DWORD64 base, DWORD64 pc, PRUNT
 #define VK_F10 0x79
 #define VK_F11 0x7A
 #define VK_F12 0x7B
+#define VK_SCROLL 0x91
 #define VK_LSHIFT 0xA0
 #define VK_RSHIFT 0xA1
 #define VK_LCONTROL 0xA2
@@ -575,6 +579,7 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type);
 #define FW_MEDIUM 500
 #define FW_SEMIBOLD 600
 #define FW_BOLD 700
+#define FW_HEAVY 900
 #define DEFAULT_CHARSET 1
 #define OUT_DEFAULT_PRECIS 0
 #define CLIP_DEFAULT_PRECIS 0
@@ -609,6 +614,8 @@ COLORREF SetTextColor(HDC dc, COLORREF c);
 UINT SetTextAlign(HDC dc, UINT align);
 BOOL TextOutA(HDC dc, int x, int y, LPCSTR s, int n);
 BOOL GetTextExtentPoint32A(HDC dc, LPCSTR s, int n, SIZE *size);
+HRGN CreateRectRgn(int x1, int y1, int x2, int y2);
+int SelectClipRgn(HDC dc, HRGN rgn);
 
 #ifdef __cplusplus
 }

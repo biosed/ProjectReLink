@@ -10,12 +10,13 @@
 #define STBTT_STATIC
 #include "stb_truetype.h"
 
-enum { G_DC = 0x47444301, G_BITMAP, G_FONT, G_BRUSH };
+enum { G_DC = 0x47444301, G_BITMAP, G_FONT, G_BRUSH, G_RGN };
 typedef struct { int type; } GObj;
 typedef struct { GObj o; int w, h; uint32_t *bits; } GBitmap;
 typedef struct { GObj o; int px, bold, aa; } GFont;
 typedef struct { GObj o; COLORREF c; } GBrush;
-typedef struct { GObj o; GBitmap *bmp; GFont *font; COLORREF text; UINT align; int bk; } GDc;
+typedef struct { GObj o; int x0, y0, x1, y1; } GRgn;
+typedef struct { GObj o; GBitmap *bmp; GFont *font; COLORREF text; UINT align; int bk; int has_clip, clip_x0, clip_y0, clip_x1, clip_y1; } GDc;
 
 /* ---- the fonts: regular and bold, loaded once ---- */
 typedef struct { unsigned char *data; stbtt_fontinfo info; int ok; } Face;
@@ -138,13 +139,35 @@ HBRUSH CreateSolidBrush(COLORREF c) {
     b->o.type = G_BRUSH, b->c = c;
     return b;
 }
+HRGN CreateRectRgn(int x1, int y1, int x2, int y2) {
+    if (x1 > x2) { int t = x1; x1 = x2; x2 = t; }
+    if (y1 > y2) { int t = y1; y1 = y2; y2 = t; }
+    GRgn *r = (GRgn *)calloc(1, sizeof *r);
+    r->o.type = G_RGN, r->x0 = x1, r->y0 = y1, r->x1 = x2, r->y1 = y2;
+    return r;
+}
+int SelectClipRgn(HDC hdc, HRGN hrgn) {
+    GDc *d = (GDc *)hdc;
+    if (!d) return 0;
+    if (!hrgn) { d->has_clip = 0; return 1; }
+    const GRgn *r = (const GRgn *)hrgn;
+    if (r->o.type != G_RGN) return 0;
+    d->clip_x0 = r->x0, d->clip_y0 = r->y0, d->clip_x1 = r->x1, d->clip_y1 = r->y1, d->has_clip = 1;
+    return 2;
+}
 static uint32_t bgrx(COLORREF c) { return (uint32_t)(c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF); }
 int FillRect(HDC hdc, const RECT *r, HBRUSH hb) {
     GDc *d = (GDc *)hdc;
     if (!d || !d->bmp || !hb) return 0;
     const uint32_t px = bgrx(((GBrush *)hb)->c);
-    const int x0 = r->left < 0 ? 0 : r->left, y0 = r->top < 0 ? 0 : r->top;
-    const int x1 = r->right > d->bmp->w ? d->bmp->w : r->right, y1 = r->bottom > d->bmp->h ? d->bmp->h : r->bottom;
+    int x0 = r->left < 0 ? 0 : r->left, y0 = r->top < 0 ? 0 : r->top;
+    int x1 = r->right > d->bmp->w ? d->bmp->w : r->right, y1 = r->bottom > d->bmp->h ? d->bmp->h : r->bottom;
+    if (d->has_clip) {
+        if (x0 < d->clip_x0) x0 = d->clip_x0;
+        if (y0 < d->clip_y0) y0 = d->clip_y0;
+        if (x1 > d->clip_x1) x1 = d->clip_x1;
+        if (y1 > d->clip_y1) y1 = d->clip_y1;
+    }
     for (int y = y0; y < y1; y++)
         for (int x = x0; x < x1; x++) d->bmp->bits[(size_t)y * d->bmp->w + x] = px;
     return 1;
@@ -217,12 +240,16 @@ BOOL TextOutA(HDC hdc, int x, int y, LPCSTR s, int n) {
             unsigned char *g = (unsigned char *)malloc((size_t)gw * gh);
             stbtt_MakeCodepointBitmapSubpixel(&face->info, g, gw, gh, gw, sc, sc, sub, 0, cp);
             const int ox = (int)floorf(pen) + x0, oy = baseline + y0;
+            const int cx0 = d->has_clip && d->clip_x0 > 0 ? d->clip_x0 : 0;
+            const int cy0 = d->has_clip && d->clip_y0 > 0 ? d->clip_y0 : 0;
+            const int cx1 = d->has_clip && d->clip_x1 < d->bmp->w ? d->clip_x1 : d->bmp->w;
+            const int cy1 = d->has_clip && d->clip_y1 < d->bmp->h ? d->clip_y1 : d->bmp->h;
             for (int yy = 0; yy < gh; yy++) {
                 const int py = oy + yy;
-                if (py < 0 || py >= d->bmp->h) continue;
+                if (py < cy0 || py >= cy1) continue;
                 for (int xx = 0; xx < gw; xx++) {
                     const int px = ox + xx;
-                    if (px < 0 || px >= d->bmp->w) continue;
+                    if (px < cx0 || px >= cx1) continue;
                     unsigned a = g[yy * gw + xx];
                     if (!aa) a = a >= 128 ? 255 : 0;
                     if (!a) continue;
