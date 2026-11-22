@@ -276,6 +276,7 @@ bool vk_on_present_thread();   // (relink: the calling thread is the game's pres
 int vk_value_is_mine(uint64_t v);   // (relink, diagnostic: the calling thread began that timeline value's recording: 1, 0, -1 unknown)
 uint64_t vk_present_value();        // (relink: the newest timeline value begun when the last present came)
 void vk_timeline_wait(uint64_t v);
+bool vk_timeline_wait_for(uint64_t v, uint32_t ms);
 uint32_t memory_generation();
 /// (relink) bumped each time a pool leaves the table or its buffer is given back (vk_memory.cpp pools_gen): what was made over a
 /// pool's buffer before may be over a destroyed one now (texel_buffer_view)
