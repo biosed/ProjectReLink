@@ -130,11 +130,13 @@ def exefs_sites():
     import oot_occlusion
     import oot_fov
     import oot_step_rate
+    import oot_rekarina_fixes
     return {"widescreen": [oot_wide.MAIN + s[0] for s in oot_wide.SITES],
             "camera jitter (DLSS, FSR)": [oot_wide.MAIN + s[0] for s in oot_jitter.SITES],
             "Occlusion Off": [oot_occlusion.MAIN + o for o in oot_occlusion.OFFSETS],
             "field of view": [oot_fov.MAIN + oot_fov.SITE],
-            "the frame rate above 60 fps": [oot_step_rate.MAIN + oot_step_rate.SITE]}
+            "the frame rate above 60 fps": [oot_step_rate.MAIN + oot_step_rate.SITE],
+            "Rekarina stability & FPS fixes": [oot_rekarina_fixes.MAIN + o for o in oot_rekarina_fixes.all_offsets()]}
 
 
 def main():
@@ -194,6 +196,8 @@ def main():
         oot_fov.install(L, img)
         import oot_step_rate   # (relink, issues 16 and 67) the time step follows the real frame rate above 60 fps too
         oot_step_rate.install(L, img)
+        import oot_rekarina_fixes   # (relink) Rekarina v1.2.10 stability & high-FPS fixes (override/replace/after)
+        oot_rekarina_fixes.install(L, img)
         # (relink) A64_LOCAL_REGS: the functions the text patches look for after the lift (oot_patches.py and
         # oot_native_resolution.py name them; their patterns spell the guest's registers as the context's) keep their
         # registers in the context. Without this four of those patches found nothing (build fp_v3loc, 2026-11-18)
