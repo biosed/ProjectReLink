@@ -62,6 +62,8 @@
 #include "prompt_tex.h"
 #include "ocarina_tex.h"
 #include "target_overlap.h"
+#include "staging_retry.h"
+#include "dispatch_barrier.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -459,12 +461,74 @@ Staging staging(uint64_t n, uint64_t align = 256) {
             return {a.buffer, 0, a.mapped};
         }
     }
+    const uint64_t arena_size = std::max(kArena, uint64_t((n + 0xFFFFF) & ~0xFFFFFull));
     Arena a;
-    a.size = std::max(kArena, uint64_t((n + 0xFFFFF) & ~0xFFFFFull));
+    a.size = arena_size;
     void* m = nullptr;
-    if (!create_buffer(a.size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
-                       a.allocation, &m) || !m)
+    auto try_alloc = [&](uint64_t bytes) {
+        m = nullptr;
+        a.buffer = VK_NULL_HANDLE;
+        a.allocation = nullptr;
+        a.size = bytes;
+        return create_buffer(bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, a.buffer,
+                             a.allocation, &m) && m;
+    };
+    auto reuse_completed = [&]() -> Staging {
+        for (Arena& ex : arenas) {
+            if (ex.value != rec_value && ex.value <= completed_value && ex.size >= n) {
+                ex.value = rec_value, ex.used = n;
+                ex.used_at = std::chrono::steady_clock::now();
+                return {ex.buffer, 0, ex.mapped};
+            }
+        }
         return {};
+    };
+    auto drop_completed = [&]() {
+        for (auto it = arenas.begin(); it != arenas.end();) {
+            if (it->value != rec_value && it->value <= completed_value) {
+                destroy_buffer(it->buffer, it->allocation);
+                it = arenas.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+    if (!try_alloc(arena_size)) {
+        // Rekarina v1.2.10: reclaim finished arenas, shrink to fitted size, and wait for oldest in-flight arena if needed.
+        const auto t0 = std::chrono::steady_clock::now();
+        static std::atomic<int> retry_logs{0};
+        completed_value = std::max(completed_value, vk_timeline_completed());
+        if (const Staging reused = reuse_completed(); reused.buffer) {
+            if (retry_logs.fetch_add(1, std::memory_order_relaxed) < 8)
+                logf("vk: staging arena (%llu MB) refused: reused completed arena", (unsigned long long)(arena_size >> 20));
+            return reused;
+        }
+        drop_completed();
+        const uint64_t exact_size = staging_retry::exact_arena_size(n);
+        bool ok = exact_size < arena_size && try_alloc(exact_size);
+        if (!ok) {
+            const size_t oldest = staging_retry::find_oldest_inflight(arenas.data(), arenas.size(), rec_value, completed_value);
+            if (oldest != SIZE_MAX) {
+                vk_timeline_wait_for(arenas[oldest].value, 2000);
+                completed_value = std::max(completed_value, vk_timeline_completed());
+                if (const Staging reused = reuse_completed(); reused.buffer) {
+                    if (retry_logs.fetch_add(1, std::memory_order_relaxed) < 8)
+                        logf("vk: staging arena (%llu MB) refused: reused arena after wait (%.1f ms)",
+                             (unsigned long long)(arena_size >> 20),
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    return reused;
+                }
+                drop_completed();
+                ok = try_alloc(exact_size);
+            }
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (retry_logs.fetch_add(1, std::memory_order_relaxed) < 8)
+            logf("vk: staging arena for %llu bytes (requested %llu MB, fitted %llu KB) %s after %.1f ms",
+                 (unsigned long long)n, (unsigned long long)(arena_size >> 20), (unsigned long long)(exact_size >> 10),
+                 ok ? "allocated on retry" : "refused", ms);
+        if (!ok) return {};
+    }
     a.mapped = (uint8_t*)m;
     a.value = rec_value, a.used = n;
     a.used_at = std::chrono::steady_clock::now();
@@ -3141,11 +3205,20 @@ namespace {
 // (each thread's own: the display thread's present records barriers too)
 thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the command buffer this thread's last full barrier went into, and the work count then)
 thread_local uint64_t last_barrier_epoch = 0;
-std::atomic<int64_t> st_barriers_made{0}, st_barriers_left_out{0};
+thread_local uint8_t tl_barrier_work_kind = 0;
+std::atomic<int64_t> st_barriers_made{0}, st_barriers_left_out{0}, st_dispatch_barriers_relaxed{0};
 } // namespace
 void barrier_stats(int64_t* made, int64_t* left_out) {
     *made = st_barriers_made.load(std::memory_order_relaxed), *left_out = st_barriers_left_out.load(std::memory_order_relaxed);
 }
+void barrier_note_work_kind(uint8_t kind) {
+    tl_barrier_work_kind = kind == dispatch_barrier::kWorkNone
+                               ? dispatch_barrier::kWorkNone
+                               : dispatch_barrier::note_work_kind(tl_barrier_work_kind, kind);
+}
+uint8_t barrier_work_kind() { return tl_barrier_work_kind; }
+void barrier_note_dispatch_relaxed() { st_dispatch_barriers_relaxed.fetch_add(1, std::memory_order_relaxed); }
+int64_t barrier_dispatch_relaxed() { return st_dispatch_barriers_relaxed.load(std::memory_order_relaxed); }
 
 // (relink) A full barrier right after another one on the same command buffer, no command that does or orders GPU work in between
 // (vk_work.h counts them), orders nothing the first did not: left out. The game's own barrier (end of a pass), then the next pass's
@@ -3155,6 +3228,7 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     const bool dedupe = !off && !par_active.load(std::memory_order_relaxed);   // (a parallel replay's threads share command buffers and the count)
     if (dedupe && cmd == last_barrier_cmd && work_epoch.load(std::memory_order_relaxed) == last_barrier_epoch) {
         st_barriers_left_out.fetch_add(1, std::memory_order_relaxed);
+        tl_barrier_work_kind = 0;
         return;
     }
     st_barriers_made.fetch_add(1, std::memory_order_relaxed);
@@ -3168,6 +3242,7 @@ void full_barrier(VkCommandBuffer cmd, const char* why) {
     d.pMemoryBarriers = &b;
     vkCmdPipelineBarrier2(cmd, &d);
     last_barrier_cmd = cmd, last_barrier_epoch = work_epoch.load(std::memory_order_relaxed);
+    tl_barrier_work_kind = 0;
 }
 
 // (relink) Scene changes made hundreds of textures in one frame (leaving the house: 562 textures in frame 2702, the way to
@@ -3217,6 +3292,7 @@ void texture_prefetch_some() {
 }
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     last_barrier_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
+    tl_barrier_work_kind = 0;
     up_cmd = upload;
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;

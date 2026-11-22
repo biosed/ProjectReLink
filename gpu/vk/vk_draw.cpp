@@ -47,6 +47,7 @@
 #include "movie_upscale_policy.h"
 #include "skip_code.h"
 #include "direct_ub_snapshot.h"
+#include "dispatch_barrier.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -4346,7 +4347,6 @@ struct Pass {
     uint8_t stand_in = 0;                  // (relink, issue 21: colour i bit i, a stand-in copied back at its end)
 };
 TLS_OBJECT(pass, Pass)
-thread_local bool work_since_barrier = false;   // (GPU work recorded since the last full barrier: a dispatch orders after it)
 // what the command buffer has bound (draws skip what is already there)
 thread_local bool last_desc_valid = false;
 thread_local const Program* last_desc_prog = nullptr;
@@ -4482,7 +4482,7 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     if (same) return;
     end_pass(cmd);
     full_barrier(cmd, "barrier (pass start)");   // (what the pass before wrote, and the transfers before it)
-    work_since_barrier = true;
+    barrier_note_work_kind(dispatch_barrier::kWorkOther);
     if (at.stand_in) {   // (relink, issue 21) what the compressed targets hold, into the images that stand in for them
         for (int i = 0; i < at.n; i++)
             if (at.stand_in >> i & 1) texture_stand_in_copy(cmd, at.color[i], at.color_view[i], true);
@@ -5229,7 +5229,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     r.direct_ub_at.reset();
     cur = &r;
     pass() = Pass{};
-    work_since_barrier = false;
+    barrier_note_work_kind(dispatch_barrier::kWorkNone);
     last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
     vertex_set.on = false, last_ib.on = false;
     descriptors_disturbed();
@@ -10147,10 +10147,21 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         logf("%s", line);
     }
     // (dispatches after other work wait for it: the WebGPU renderer's dispatches were ordered the same way by
-    // wgpu's own tracking, and MKW's compute chains read what the one before wrote)
-    static const bool no_order = getenv("RX_VK_NO_DISPATCH_ORDER") != nullptr;
-    if (work_since_barrier && !no_order) full_barrier(cmd, "barrier (dispatch)");
-    work_since_barrier = true;
+    // wgpu's own tracking, and MKW's compute chains read what the one before wrote. RX_VK_DISPATCH_BARRIER=game
+    // opts out of compute-after-compute barriers when no graphics/transfer work intervened; RX_VK_NO_DISPATCH_ORDER=1 disables all)
+    static const dispatch_barrier::Mode barrier_mode = []() {
+        const auto m = dispatch_barrier::parse_mode(getenv("RX_VK_DISPATCH_BARRIER"), getenv("RX_VK_NO_DISPATCH_ORDER"));
+        if (m != dispatch_barrier::Mode::Full)
+            logf("vk: dispatch barrier mode = %s (RX_VK_DISPATCH_BARRIER)", dispatch_barrier::mode_name(m));
+        return m;
+    }();
+    const uint8_t prior_work = barrier_work_kind();
+    if (dispatch_barrier::need_dispatch_barrier(barrier_mode, prior_work)) {
+        full_barrier(cmd, "barrier (dispatch)");
+    } else if (prior_work != dispatch_barrier::kWorkNone) {
+        barrier_note_dispatch_relaxed();
+    }
+    barrier_note_work_kind(dispatch_barrier::kWorkDispatch);
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram || p.key == 0x6ccba775ea111ee9ull) replay_saw_exposure = true;
     {   // (relink, RX_VK_METER_ZERO=1) OoT's exposure meter: 435a0138b9013040 and 592079442d7129da add a frame's
         // sums into the first 16 bytes of their block, which the game reads and sets back to zero. With the game ahead of the
@@ -10277,6 +10288,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             vkCmdDispatch(cmd, x, y, z);
         }
     }
+    barrier_note_work_kind(dispatch_barrier::kWorkDispatch);
     wheel_scene_note(cmd, s, p, false);   // (relink: the game's own gameplay upscale, for the item wheel)
     if (dump_on() && dump_ssbo_wanted(p.key)) dump_ssbos(cmd, p, "after");
     if (peek_prog(p.key)) peek_draw(cmd, p.key, false);   // (relink: RX_VK_PEEK_PROG, what the dispatch left)

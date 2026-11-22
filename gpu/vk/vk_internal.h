@@ -287,6 +287,10 @@ extern thread_local bool ui_note_rb_only;   // (relink: only buffers on a page t
 void memory_note_read_range(uint64_t guest, uint64_t size);   // (relink: the game is about to read GPU results there)
 /// (vk_replay.cpp) The GPU's progress on the recordings' timeline, and a wait for it to reach v
 uint64_t vk_timeline_completed();
+void barrier_note_work_kind(uint8_t kind);
+uint8_t barrier_work_kind();
+void barrier_note_dispatch_relaxed();
+int64_t barrier_dispatch_relaxed();
 bool vk_on_present_thread();   // (relink: the calling thread is the game's presenting thread)
 int vk_value_is_mine(uint64_t v);   // (relink, diagnostic: the calling thread began that timeline value's recording: 1, 0, -1 unknown)
 uint64_t vk_present_value();        // (relink: the newest timeline value begun when the last present came)

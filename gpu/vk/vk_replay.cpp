@@ -883,6 +883,7 @@ void gpu_write(VkCommandBuffer cmd, uint64_t gpu, const void* data, uint64_t n) 
             host->gpu_write(gpu, d, k);
         } else {
             vkCmdUpdateBuffer(cmd, b.buffer, b.offset, k, d);
+            barrier_note_work_kind(2);   // dispatch_barrier::kWorkOther
         }
         gpu += k, d += k, n -= k;
     }
@@ -3529,12 +3530,18 @@ void log_frame_stats() {
              (long long)tr, (long long)fl, texture_count(), (unsigned long long)(texture_bytes() >> 20));
         draw_skip_report(120.0);
         {   // (relink: the full barriers recorded and the ones left out as the second of two in a row, RX_VK_BARRIER_DEDUPE_OFF=1)
-            static int64_t l_made, l_left;
+            static int64_t l_made, l_left, l_relaxed;
             int64_t made = 0, left = 0;
             barrier_stats(&made, &left);
-            logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before)", (made - l_made) / 120.0,
-                 (left - l_left) / 120.0);
-            l_made = made, l_left = left;
+            const int64_t relaxed = barrier_dispatch_relaxed();
+            if (relaxed != l_relaxed) {
+                logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before), %.1f dispatch relaxed (RX_VK_DISPATCH_BARRIER)",
+                     (made - l_made) / 120.0, (left - l_left) / 120.0, (relaxed - l_relaxed) / 120.0);
+            } else {
+                logf("vk: a frame: %.1f full barriers recorded, %.1f left out (nothing recorded since the one before)",
+                     (made - l_made) / 120.0, (left - l_left) / 120.0);
+            }
+            l_made = made, l_left = left, l_relaxed = relaxed;
             std::string fl;   // (NVN's barrier bits: ORDER_PRIMITIVES 1, ORDER_FRAGMENTS 2, ORDER_FRAGMENTS_TILED 4, ORDER_INDIRECT_DATA 8, INVALIDATE_TEXTURE 0x10, _SHADER 0x20, _TEXTURE_DESCRIPTOR 0x40, _ZCULL 0x80)
             std::lock_guard lk(st_barrier_flags_mu);
             for (const auto& [bits, n] : st_barrier_flags) {
