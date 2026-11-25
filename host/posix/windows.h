@@ -617,6 +617,43 @@ UINT SetTextAlign(HDC dc, UINT align);
 BOOL TextOutA(HDC dc, int x, int y, LPCSTR s, int n);
 BOOL GetTextExtentPoint32A(HDC dc, LPCSTR s, int n, SIZE *size);
 
+/* ---- memory status: from /proc/meminfo for predict/ahead headroom checks ---- */
+typedef struct {
+    DWORD dwLength;
+    DWORD dwMemoryLoad;
+    DWORDLONG ullTotalPhys;
+    DWORDLONG ullAvailPhys;
+    DWORDLONG ullTotalPageFile;
+    DWORDLONG ullAvailPageFile;
+    DWORDLONG ullTotalVirtual;
+    DWORDLONG ullAvailVirtual;
+    DWORDLONG ullAvailExtendedVirtual;
+} MEMORYSTATUSEX;
+static inline BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *out) {
+    if (!out || out->dwLength < sizeof *out) return FALSE;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return FALSE;
+    unsigned long long mem_total = 0, mem_avail = 0, swap_total = 0, swap_free = 0;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemTotal: %llu", &kb) == 1) mem_total = kb;
+        else if (sscanf(line, "MemAvailable: %llu", &kb) == 1) mem_avail = kb;
+        else if (sscanf(line, "SwapTotal: %llu", &kb) == 1) swap_total = kb;
+        else if (sscanf(line, "SwapFree: %llu", &kb) == 1) swap_free = kb;
+    }
+    fclose(f);
+    if (!mem_total) return FALSE;
+    memset(out, 0, sizeof *out);
+    out->dwLength = sizeof *out;
+    out->ullTotalPhys = mem_total << 10;
+    out->ullAvailPhys = mem_avail << 10;
+    out->ullTotalPageFile = (mem_total + swap_total) << 10;
+    out->ullAvailPageFile = (mem_avail + swap_free) << 10;
+    out->dwMemoryLoad = mem_avail < mem_total ? (DWORD)(((mem_total - mem_avail) * 100) / mem_total) : 0;
+    return TRUE;
+}
+
 #ifdef __cplusplus
 }
 #endif

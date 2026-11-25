@@ -27,10 +27,12 @@ def main() -> None:
     fsr = (ROOT / "gpu" / "vk" / "vk_fsr.cpp").read_text(encoding="utf-8")
     start = function(fsr, "void fsr_start()")
     assert 'getenv("RX_VK_FSR")' in start
-    assert 'getenv("RX_VK_FSR_LIB")' in start
-    assert "dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL)" in start
-    assert "dlsym(api.dll, \"ffxCreateContext\")" in start
-    assert "g_why.store(FSR_OK, std::memory_order_release)" in start
+    assert "try_runtime(" in start
+    try_rt = function(fsr, "bool try_runtime(bool legacy, bool second, bool* was_sdk2)")
+    assert 'getenv("RX_VK_FSR_LIB")' in try_rt
+    assert "dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL)" in try_rt
+    assert 'dlsym(api.dll, "ffxCreateContext")' in try_rt
+    assert "g_why.store(FSR_OK, std::memory_order_release)" in try_rt
 
     reflex = (ROOT / "gpu" / "vk" / "vk_reflex.cpp").read_text(encoding="utf-8")
     enable = function(reflex, "void reflex_enable_implicit_layer()")
