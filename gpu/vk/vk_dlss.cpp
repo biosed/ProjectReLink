@@ -1616,13 +1616,9 @@ void dlss_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height
     // b = -2 f n / (f - n), so n = b / (a - 1) and f = b / (a + 1), none when a is -1. The depth buffer then holds
     // (z / w + 1) / 2, which is what a 0-to-1 projection with the same planes writes: the depth FSR expects. Row 1's second
     // value is the cotangent of half the vertical field of view. Values that do not make a camera keep the last ones
-    const float p11 = c[0x84 / 4], a = c[0x98 / 4], bb = c[0x9c / 4];
-    const float n_z = bb / (a - 1.0f);
-    const bool infinite = std::fabs(a + 1.0f) < 1e-6f;
-    const float f_z = infinite ? 0.0f : bb / (a + 1.0f);
-    if (p11 > 0.0f && std::isfinite(n_z) && n_z > 0.0f && (infinite || (std::isfinite(f_z) && f_z > n_z))) {
-        k.near_z = n_z, k.far_z = infinite ? 1e30f : f_z, k.infinite = infinite;
-        k.fov_y = 2.0f * std::atan(1.0f / p11);
+    dlss_math::CameraProjection proj;
+    if (dlss_math::camera_projection(c[0x84 / 4], c[0x98 / 4], c[0x9c / 4], proj)) {
+        k.near_z = proj.near_z, k.far_z = proj.far_z, k.infinite = proj.infinite, k.fov_y = proj.fov_y;
     }
     k.width = width, k.height = height, k.depth = depth, k.depth_gen = texture_destroy_generation(), k.frame = now;
     k.valid = true;
