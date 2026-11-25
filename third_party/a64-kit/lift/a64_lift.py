@@ -1401,6 +1401,9 @@ class Lifter:
         # (relink) C emitted right after the instruction at a guest address ({pc: text}): a game patch that adds to an
         # instruction instead of replacing a function (nx2/oot_wide.py). Only after plain instructions (kind "op")
         self.after = {}
+        # (relink) Lift-time word overrides ({pc: word}) and C replacements ({pc: text}) for game patches
+        self.override = {}
+        self.replace = {}
         self.funcs = {}       # entry -> (body {pc: kind}, labels set)
         self.jt = {}          # br pc -> [targets]
         self.jt_missing = {}      # br pc -> its register, for BRs whose table address was not found
@@ -1514,7 +1517,7 @@ class Lifter:
             while pc not in body:
                 if (pc != entry and pc in entries) or not img.in_code(pc):
                     break
-                w = img.word(pc)
+                w = self.word(pc)
                 k = classify(w, pc)
                 body[pc] = (k, w)
                 kind = k[0]
@@ -1555,7 +1558,7 @@ class Lifter:
                 R.clear()
                 bounds.clear()
                 continue
-            w = img.word(pc)
+            w = self.word(pc)
             if (w & 0xFC000000) == 0x14000000 or (w & 0xFFFFFC1F) in (0xD65F0000, 0xD61F0000):
                 # ret / b / br: what follows is reached from elsewhere, so nothing above is known there
                 R.clear()
@@ -1710,7 +1713,7 @@ class Lifter:
         for pc in range(lo, hi, 4):
             if not img.in_code(pc):
                 continue
-            k = classify(img.word(pc), pc)
+            k = classify(self.word(pc), pc)
             kind = k[0]
             if kind == "b":
                 succ = (k[1],)
@@ -1757,7 +1760,7 @@ class Lifter:
                 if p in seen:
                     continue
                 seen.add(p)
-                w = img.word(p)
+                w = self.word(p)
                 if kind_loc == "reg":
                     if classify(w, p)[0] in ("bl", "blr") and (x <= 18 or x == 30):
                         continue
@@ -1819,7 +1822,7 @@ class Lifter:
         page = {}
         found = set()
         for pc in range(lo, hi, 4):
-            w = img.word(pc)
+            w = self.word(pc)
             d = w & 31
             if (w & 0x9F000000) == 0x90000000:                                   # ADRP
                 imm = ((w >> 3) & 0x1FFFFC) | ((w >> 29) & 3)
@@ -1840,7 +1843,7 @@ class Lifter:
             return None
         targets = []
         for pc in range(lo, hi, 4):
-            w = img.word(pc)
+            w = self.word(pc)
             if (w & 0x9F00001F) == (0x10000000 | reg):
                 imm = ((w >> 3) & 0x1FFFFC) | ((w >> 29) & 3)
                 t = pc + sx(imm, 21)
@@ -1859,7 +1862,7 @@ class Lifter:
         for _ in range(scan):
             if not img.in_code(pc):
                 return None
-            w = img.word(pc)
+            w = self.word(pc)
             if (w & 31) == reg and not self.reads_rt_only(w):
                 if (w & 0x9F000000) == 0x90000000:                               # ADRP Xreg, page
                     imm = ((w >> 3) & 0x1FFFFC) | ((w >> 29) & 3)
@@ -1887,10 +1890,13 @@ class Lifter:
         return lo, hi
 
     # ---- PLT stubs -----------------------------------------------------------------------------------
+    def word(self, pc):
+        return self.override.get(pc, self.img.word(pc))
+
     def plt_target(self, e):
         img = self.img
         try:
-            w0, w1, w2, w3 = (img.word(e + 4 * i) for i in range(4))
+            w0, w1, w2, w3 = (self.word(e + 4 * i) for i in range(4))
         except Exception:
             return None
         if (w0 & 0x9F00001F) != 0x90000010 or (w1 & 0xFFC003FF) != 0xF9400211 or (w2 & 0xFFC003FF) != 0x91000210 \
@@ -2010,11 +2016,16 @@ class Lifter:
             kind = k[0]
             targets, falls = [], True
             if kind == "op":
-                text, fl = texts[(w, pc) if pc_relative(w) else w]
-                if fl & a64emit.UNHANDLED:
-                    falls = False
+                if pc in self.replace:
+                    writes[i] = reg_writes(self.replace[pc])
                 else:
-                    writes[i] = reg_writes(text)
+                    text, fl = texts[(w, pc) if pc_relative(w) else w]
+                    if fl & a64emit.UNHANDLED:
+                        falls = False
+                    else:
+                        writes[i] = reg_writes(text)
+                if pc in self.after and falls:
+                    writes[i] |= reg_writes(self.after[pc])
             elif kind == "b":
                 targets, falls = [k[1]], False
             elif kind in ("bcond", "cbz", "tbz"):
@@ -2071,23 +2082,33 @@ class Lifter:
             nxt = pc + 4
             falls = True
             if kind == "op":
-                text, flags = texts[(w, pc) if pc_relative(w) else w]
-                if flags & a64emit.UNHANDLED:
-                    self.unhandled[w] += 1
-                    out.append(SYNC_ALL % i + "a64_trap(c, 0x%xULL, 0x%08xu); return;" % (pc, w))
-                    falls = False
-                elif flags & a64emit.TERMINATOR:
-                    raise SystemExit("a64emit closed a block at %#x (%08x): classify() must handle it" % (pc, w))
-                else:
-                    if frame and not fp_is_frame(text):
+                if pc in self.replace:
+                    emitted = self.replace[pc].rstrip("\n")
+                    if frame and not fp_is_frame(emitted):
                         frame = False
-                    if pc in dead:
-                        text = drop_flag_stores(text, dead[pc])
-                        self.stats["dead_flag_stores"] += bin(dead[pc]).count("1")
-                    out.append(text.rstrip("\n"))
+                    out.append(emitted)
+                    self.stats["replace_patches"] = self.stats.get("replace_patches", 0) + 1
                     if pc in self.after:
                         out.append(self.after[pc])
                         self.stats["after_patches"] = self.stats.get("after_patches", 0) + 1
+                else:
+                    text, flags = texts[(w, pc) if pc_relative(w) else w]
+                    if flags & a64emit.UNHANDLED:
+                        self.unhandled[w] += 1
+                        out.append(SYNC_ALL % i + "a64_trap(c, 0x%xULL, 0x%08xu); return;" % (pc, w))
+                        falls = False
+                    elif flags & a64emit.TERMINATOR:
+                        raise SystemExit("a64emit closed a block at %#x (%08x): classify() must handle it" % (pc, w))
+                    else:
+                        if frame and not fp_is_frame(text):
+                            frame = False
+                        if pc in dead:
+                            text = drop_flag_stores(text, dead[pc])
+                            self.stats["dead_flag_stores"] += bin(dead[pc]).count("1")
+                        out.append(text.rstrip("\n"))
+                        if pc in self.after:
+                            out.append(self.after[pc])
+                            self.stats["after_patches"] = self.stats.get("after_patches", 0) + 1
             elif kind == "b":
                 out.append(self.transfer(pc, k[1], labels, body))
                 falls = False
