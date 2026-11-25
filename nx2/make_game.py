@@ -1046,7 +1046,7 @@ def lift_key(exefs, work, env):
     lift_env = dict(env, **{k: v for k, v in os.environ.items() if k.startswith(("A64_", "OOT_", "RX_"))})
     # (relink) the profiles are the compile's (build.py), not the lift's: a profile made, changed or taken away does not lift again
     # (a profile cycle lifted three times for the same C, 8 minutes each)
-    lift_env = {k: v for k, v in lift_env.items() if k not in ("RX_PGO", "RX_VK_PGO", "RX_VK_PGO_FILE")}
+    lift_env = {k: v for k, v in lift_env.items() if k not in ("RX_PGO", "RX_VK_PGO", "RX_VK_PGO_FILE", "RX_VK_LTO")}
     h.update(repr(sorted(lift_env.items())).encode())
     return h.hexdigest()
 

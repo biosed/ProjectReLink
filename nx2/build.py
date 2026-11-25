@@ -280,6 +280,17 @@ def astcenc_flags():
     return ["-DASTCENC_NEON=0", "-DASTCENC_SVE=0", "-DASTCENC_X86_GATHERS=0"] + simd + ["-I" + ASTCENC]
 
 
+def vk_lto_flags(env=None):
+    """Opt-in ThinLTO flags for renderer TUs (RX_VK_LTO=thin)."""
+    val = (os.environ if env is None else env).get("RX_VK_LTO", "").strip().lower()
+    return ["-flto=thin"] if val == "thin" else []
+
+
+def vk_is_renderer_tu(src, vk_dir):
+    """True for gpu/vk/*.cpp renderer TUs only (excludes Eden, sirit, astcenc, suyu)."""
+    return os.path.dirname(os.path.abspath(src)) == os.path.abspath(vk_dir)
+
+
 def toolchain_is_x86():
     import platform
     return platform.machine().lower() in ("amd64", "x86_64", "x64", "i386", "i686", "")
@@ -1067,6 +1078,9 @@ def main():
             with open(vk_pgo, "rb") as f:
                 vk_pgo_flags = ["-fprofile-instr-use=" + vk_pgo, "-DRX_VK_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
             print("the Vulkan back end: built with the profile %s" % vk_pgo, flush=True)
+        lto_flags = vk_lto_flags() if LINUX else []
+        if lto_flags:
+            print("the Vulkan back end: ThinLTO enabled for renderer TUs (RX_VK_LTO=thin)", flush=True)
         for src in vk_sources():
             if os.path.dirname(src) == ASTCENC:   # (igpu-fix: ARM's ASTC codec, its own flags and a name of its own)
                 vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_astcenc_" + os.path.basename(src)[:-4] + ".o"),
@@ -1075,8 +1089,9 @@ def main():
                 continue
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
+            tu_lto = lto_flags if (not lib and vk_is_renderer_tu(src, vk)) else []
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([] if lib else vk_pgo_flags) + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
+                            vflags + ([] if lib else vk_pgo_flags) + tu_lto + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
                             (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []),
                             vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_menu.cpp" else b"")))
@@ -1273,7 +1288,7 @@ def main():
         t = time.time()
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + [
-                "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
+                "-fuse-ld=lld"] + vk_lto_flags() + ["-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
                 "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
