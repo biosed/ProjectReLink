@@ -950,8 +950,11 @@ void written_types(const Code* fs, const uint8_t color_types[8], uint8_t out[8])
 uint64_t graphics_key(const Code& vs, const Code* fs, const uint32_t vattr[16], const uint8_t color_types[8]) {
     uint64_t key = vs.key ^ (fs ? fs->key * 31 : 0);
     for (int i = 0; i < 16; i++) {
+        // every input's type, not only those the program header marks as read (pixl27/ProjectReLink PR #208,
+        // VUID-VkGraphicsPipelineCreateInfo-Input-08733). RX_VK_KEY_HEADER_TYPES=1: header-only, as before.
+        static const bool header_only = getenv("RX_VK_KEY_HEADER_TYPES") && atoi(getenv("RX_VK_KEY_HEADER_TYPES")) != 0;
         const auto used = header_of(vs).vtg.InputGeneric((size_t)i);
-        const bool read = used[0] || used[1] || used[2] || used[3];
+        const bool read = !header_only || used[0] || used[1] || used[2] || used[3];
         key = key * 1099511628211ull ^ (uint64_t)(read ? attribute_type_of(vattr[i]) : Shader::AttributeType::Float) << i;
     }
     uint8_t written[8];

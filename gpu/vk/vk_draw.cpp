@@ -5108,6 +5108,51 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
     return writes;
 }
 
+// (relink, ported from longshot-oberon CM1/CM1b, GPL-3.0) RX_VK_CUBEMAP_EVERY=N: draw reflection cube faces on every Nth turn.
+// Default 1 (off) in generic code; set =3 on BC-250 to save 60-160 draws/frame in Kokiri/Field and ~300 draws/frame in Market.
+// Settling window (90 frames after any frame with <250 draws) draws every turn so area changes never flash stale lighting.
+std::atomic<int64_t> cube_turns_drawn{0}, cube_turns_left{0}, cube_draws_left{0};
+bool cubemap_face_skipped(const Targets& at) {
+    static const int every = [] {
+        const char* e = getenv("RX_VK_CUBEMAP_EVERY");
+        const int v = e ? std::max(1, atoi(e)) : 1;
+        if (v > 1) logf("vk: the reflection cube's faces drawn on every %d. turn (RX_VK_CUBEMAP_EVERY)", v);
+        return v;
+    }();
+    if (every <= 1) return false;
+    if (at.n != 1 || !at.depth || at.width != 128 || at.height != 128 || !at.color[0] || at.color_level[0] != 0 ||
+        at.color[0]->layers < 6)
+        return false;
+    struct Face { const Texture* tex = nullptr; uint64_t frame = ~0ull, turns = 0; bool skip = false; };
+    static std::mutex mu;
+    static std::unordered_map<uint64_t, Face> faces;
+    const uint64_t key = at.color[0]->gpu * 64 + at.color_layer[0], frame = texture_frame_no();
+    std::lock_guard lk(mu);
+    if (faces.size() > 512) faces.clear();
+    Face& f = faces[key];
+    if (f.tex != at.color[0]) f = Face{}, f.tex = at.color[0];
+    static uint64_t seen_frame = 0, busy_since = 0;
+    static int64_t seen_draws = 0;
+    if (frame != seen_frame) {
+        const int64_t per_frame = seen_frame && frame > seen_frame ? (st_draws - seen_draws) / (int64_t)(frame - seen_frame) : 0;
+        if (!seen_frame || per_frame < 250) busy_since = frame;
+        seen_frame = frame, seen_draws = st_draws;
+    }
+    const bool settling = frame - busy_since < 90;
+    if (f.frame != frame) {
+        f.frame = frame;
+        f.skip = !settling && (f.turns++ % (uint64_t)every) != 0;
+        (f.skip ? cube_turns_left : cube_turns_drawn).fetch_add(1, std::memory_order_relaxed);
+        const int64_t total = cube_turns_drawn.load(std::memory_order_relaxed) + cube_turns_left.load(std::memory_order_relaxed);
+        if (total % 3000 == 0)
+            logf("vk: reflection cube faces: %lld turns drawn, %lld left out, %lld draws left out (RX_VK_CUBEMAP_EVERY=%d)",
+                 (long long)cube_turns_drawn.load(std::memory_order_relaxed),
+                 (long long)cube_turns_left.load(std::memory_order_relaxed),
+                 (long long)cube_draws_left.load(std::memory_order_relaxed), every);
+    }
+    return f.skip;
+}
+
 } // namespace
 
 void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float rgba[4], uint32_t mask) {
@@ -5116,6 +5161,7 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
     if (!mask) return;
     const Targets at = targets(s);
     if (index < 0 || index >= at.n || !at.color_view[index]) return;
+    if (cubemap_face_skipped(at)) return;
     clear_after_draws(cmd);
     begin_pass(cmd, at);
     const uint32_t lw = at.width, lh = at.height;
@@ -5154,6 +5200,7 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
     ParLock lk;
     const Targets at = targets(s);
     if (!at.depth) return;
+    if (cubemap_face_skipped(at)) return;
     VkImageAspectFlags aspect = 0;
     if (depth_mask && depth_aspect(at.depth_format)) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
     if (stencil_mask && has_stencil(at.depth_format)) aspect |= VK_IMAGE_ASPECT_STENCIL_BIT;
@@ -7255,6 +7302,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     const Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
+    if (cubemap_face_skipped(at)) {
+        cube_draws_left.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     lod_scene_draw = at.n && at.color[0] && at.depth && at.width >= 640 && at.color_format[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     // (relink) the scene's camera and depth for NVIDIA DLSS (vk_dlss.cpp): the vertex stage's uniform buffer 3 (NVN's binding 0)
     if (at.n && at.color[0] && at.depth)
