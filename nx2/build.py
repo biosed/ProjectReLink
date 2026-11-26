@@ -286,6 +286,18 @@ def vk_lto_flags(env=None):
     return ["-flto=thin"] if val == "thin" else []
 
 
+def vk_cpu_flags(env=None):
+    """Opt-in target CPU flags for renderer TUs and POSIX shims (RX_VK_MARCH=<arch>)."""
+    val = (os.environ if env is None else env).get("RX_VK_MARCH", "").strip()
+    return ["-march=" + val, "-mtune=" + val, "-ffp-contract=off"] if val else None
+
+
+def vk_march_link_flags(env=None):
+    """Opt-in target CPU flags passed to Linux relink_vk.so ThinLTO link (RX_VK_MARCH=<arch>)."""
+    val = (os.environ if env is None else env).get("RX_VK_MARCH", "").strip()
+    return ["-march=" + val, "-mtune=" + val] if val else []
+
+
 def vk_is_renderer_tu(src, vk_dir):
     """True for gpu/vk/*.cpp renderer TUs only (excludes Eden, sirit, astcenc, suyu)."""
     return os.path.dirname(os.path.abspath(src)) == os.path.abspath(vk_dir)
@@ -1040,7 +1052,8 @@ def main():
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DRELINK_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
-        vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (relink: the replay is the frame's limit now)
+        vk_tu_cpu = vk_cpu_flags()
+        vflags_base = target() + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (relink: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
             "-include", "string", "-include", "vector",
@@ -1055,7 +1068,9 @@ def main():
             "-I" + os.path.join(GPU, "third_party", "suyu"),
             "-I" + os.path.join(vk, "sirit", "include"), "-I" + os.path.join(vk, "sirit", "src"),
             "-I" + os.path.join(spirv_headers, "include"), "-I" + os.path.join(spirv_headers, "include", "spirv", "unified1"),
-            "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir, "-I" + ASTCENC] +             (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
+            "-I" + os.path.join(vk_headers, "include"), "-I" + vk, "-I" + gen_dir, "-I" + ASTCENC] + \
+            (["-I" + os.path.join(cpm_package("vulkanmemoryallocator"), "include")] if cpm_package("vulkanmemoryallocator") else [])
+        vflags = vflags_base + CPU
         # (NVIDIA DLSS, a local build's option: scripts/ngx_sdk.py. Only vk_dlss.cpp sees NVIDIA's headers; without them
         # it is the stubs that say DLSS is not there)
         ngx_flags = ["-DRELINK_NGX", "-I" + os.path.join(NGX_SDK, "include")] if NGX_SDK else []
@@ -1081,6 +1096,8 @@ def main():
         lto_flags = vk_lto_flags() if LINUX else []
         if lto_flags:
             print("the Vulkan back end: ThinLTO enabled for renderer TUs (RX_VK_LTO=thin)", flush=True)
+        if vk_tu_cpu:
+            print("the Vulkan back end: target CPU %s for renderer TUs (RX_VK_MARCH)" % os.environ.get("RX_VK_MARCH", "").strip(), flush=True)
         for src in vk_sources():
             if os.path.dirname(src) == ASTCENC:   # (igpu-fix: ARM's ASTC codec, its own flags and a name of its own)
                 vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_astcenc_" + os.path.basename(src)[:-4] + ".o"),
@@ -1089,15 +1106,17 @@ def main():
                 continue
             name = os.path.relpath(src, vk).replace(os.sep, "_")[:-4]
             lib = os.path.relpath(src, vk).split(os.sep)[0] in ("eden", "sirit")
+            tu_cpu = (vk_tu_cpu or CPU) if (not lib and vk_is_renderer_tu(src, vk)) else CPU
             tu_lto = lto_flags if (not lib and vk_is_renderer_tu(src, vk)) else []
             vk_jobs.append((cxx, src, os.path.join(obj_dir, "vk_" + name + ".o"),
-                            vflags + ([] if lib else vk_pgo_flags) + tu_lto + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
+                            vflags_base + tu_cpu + ([] if lib else vk_pgo_flags) + tu_lto + ([shader_stamp] if os.path.basename(src) == "vk_shader.cpp" else []) +
                             ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []) +
                             (ngx_flags if os.path.basename(src) == "vk_dlss.cpp" else []),
                             vk_lib_deps if lib else vdeps + (logo_text if os.path.basename(src) == "vk_menu.cpp" else b"")))
         if vk_pgo == "gen":   # (the counters' writer, the DLL's own copy: its sections are the DLL's)
             vk_jobs.append((cc, os.path.join(HOST, "pgo_rt.c"), os.path.join(obj_dir, "vk_pgo_rt.o"),
-                            target() + ["-O2", "-g0", "-Wno-everything", '-DPGO_ENV="RX_VK_PGO_FILE"'], b""))
+                            target() + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) +
+                            ["-O2", "-g0", "-Wno-everything", '-DPGO_ENV="RX_VK_PGO_FILE"'], b""))
         if NGX_SDK and not LINUX and toolchain.mingw():
             # (llvm-mingw: NVIDIA's static library was built with Microsoft's compiler for its static runtime (/MT). What it asks
             # of that runtime: the C parts as for the static FFmpeg (host/mingw_msvc_shims.c), the C++ ones in vk_ngx_msvc_rt.cpp)
@@ -1105,8 +1124,8 @@ def main():
             vk_jobs.append((cc, os.path.join(HOST, "mingw_msvc_shims.c"), os.path.join(obj_dir, "vk_ngx_mingw_msvc_shims.o"),
                             target() + ["-O2", "-g0", "-Wno-everything"], b""))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
-            cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
-                                       "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
+            cflags = target() + (vk_tu_cpu or CPU) + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
+                                        "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
             pdeps = tree_headers(POSIX)
             for f in ("win32_posix.c", "gdi_posix.c"):
                 vk_jobs.append((cc, os.path.join(POSIX, f), os.path.join(obj_dir, "vk_posix_" + f[:-2] + ".o"), cflags, pdeps))
@@ -1289,7 +1308,7 @@ def main():
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
             link = [toolchain.need(toolchain.find("clang++"))] + target() + [
                 "-fuse-ld=lld"] + vk_lto_flags() + ["-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
-                "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
+                "-static-libstdc++", "-static-libgcc"] + vk_march_link_flags() + ["@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \

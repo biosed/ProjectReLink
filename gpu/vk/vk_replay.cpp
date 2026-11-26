@@ -73,6 +73,10 @@ uint64_t rec_seq = 0;                       // (the recordings submitted so far;
 // (relink, 0.7.9.3, issue 79) the newest of them handed to the driver, for the stall watch below: set before the call, which
 // a driver that hung may never return from
 std::atomic<uint64_t> rec_sent_pub{0};
+inline void note_rec_sent(uint64_t seq) {
+    uint64_t prev = rec_sent_pub.load(std::memory_order_relaxed);
+    while (prev < seq && !rec_sent_pub.compare_exchange_weak(prev, seq, std::memory_order_release, std::memory_order_relaxed)) {}
+}
 void stall_watch_start();
 std::vector<uint64_t> rec_open_values;      // (the submissions finished in the recording being made; replay_mu)
 std::mutex rec_map_mu;
@@ -183,7 +187,16 @@ void recording_wait(Recording& r) {
 
 uint64_t completed() {
     uint64_t v = 0;
-    vkGetSemaphoreCounterValue(dev.device, timeline, &v);
+    const VkResult r = vkGetSemaphoreCounterValue(dev.device, timeline, &v);
+    if (r != VK_SUCCESS) {
+        if (r == VK_ERROR_DEVICE_LOST) checkpoints_report();
+        return 0;
+    }
+    const uint64_t ceiling = q_values.load(std::memory_order_acquire);
+    if (v == UINT64_MAX || v > ceiling) {
+        checkpoints_report();
+        return 0;
+    }
     return v;
 }
 // (relink, 0.7.9.3) A recording is not handed to a device that is lost. Each one after the loss failed with -4, as the
@@ -275,7 +288,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     si.signalSemaphoreInfoCount = n;
     si.pSignalSemaphoreInfos = sig;
     PROF(PROF_QSUBMIT);
-    if (pend.rec) rec_sent_pub.store(pend.rec, std::memory_order_relaxed), stall_watch_start();
+    if (pend.rec) note_rec_sent(pend.rec), stall_watch_start();
     const VkResult res = submit_recording_to_queue(&si, VK_NULL_HANDLE);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
@@ -774,7 +787,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         return;
     }
     PROF(PROF_QSUBMIT);
-    if (seq) rec_sent_pub.store(seq, std::memory_order_relaxed), stall_watch_start();
+    if (seq) note_rec_sent(seq), stall_watch_start();
     const VkResult res = submit_recording_to_queue(&si, r.fence);
     if (tl_log_on()) {   // (every submit, for vk_tl_recent: one that signals nothing has tid 0, shown with a 'u')
         if (signal_value) {
@@ -2834,8 +2847,17 @@ uint64_t get_replayed() {
 /// timeline: true when that recording is known (the result in *ok), false when it is not (f not finished yet)
 } // namespace
 uint64_t vk_rec_completed() {
+    if (!rec_timeline) return 0;
     uint64_t v = 0;
-    if (rec_timeline) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &v);
+    const VkResult r = vkGetSemaphoreCounterValue(dev.device, rec_timeline, &v);
+    if (r != VK_SUCCESS) {
+        if (r == VK_ERROR_DEVICE_LOST) checkpoints_report();
+        return 0;
+    }
+    if (v == UINT64_MAX || v > rec_sent_pub.load(std::memory_order_acquire)) {
+        checkpoints_report();
+        return 0;
+    }
     return v;
 }
 // (relink, 0.7.9.3, issue 79) The stall watch. A GPU that stops was noticed by whichever thread waited for it with a time
