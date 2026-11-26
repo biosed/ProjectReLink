@@ -1906,10 +1906,11 @@ bool pipe_same(uint64_t prog, uint64_t variant, int topo, uint32_t samples, int 
     if (prog != cprog || variant != cvariant || topo != ctopo || samples != csamples || n != cn || depth != cdepth ||
         nvattr != cnvattr || blend_en != cblend_en || chmask != cchmask || poly != cpoly || clamp != cclamp || a2c != ca2c)
         return false;
-    for (int i = 0; i < 8; i++)
-        if (formats[i] != cformats[i] || blend[i] != cblend[i]) return false;
-    for (int i = 0; i < 16; i++)
-        if (vattr[i] != cvattr[i] || div[i] != cdiv[i]) return false;
+    if (std::memcmp(formats, cformats, 8 * sizeof(uint32_t)) != 0 ||
+        std::memcmp(blend, cblend, 8 * sizeof(uint64_t)) != 0 ||
+        std::memcmp(vattr, cvattr, 16 * sizeof(uint32_t)) != 0 ||
+        std::memcmp(div, cdiv, 16 * sizeof(uint32_t)) != 0)
+        return false;
     return true;
 }
 struct PipeFast {
@@ -2653,13 +2654,13 @@ uint32_t handle_of(const NvnState& s, const Stage& st, const D& d, uint32_t k) {
 /// keeps its 8-byte address (and the handle is not computed per draw)
 bool handle_is_storage_pointer(const Shader::Info& info, const Shader::TextureDescriptor& d, uint32_t k) {
     static const bool off = getenv("RX_VK_HANDLE_POINTER") && getenv("RX_VK_HANDLE_POINTER")[0] == '1';
-    if (off || d.handle_program != ~0U) return false;
+    if (off || d.handle_program != ~0U || info.storage_buffers_descriptors.empty()) return false;
     const uint32_t at = d.cbuf_offset + (k << d.size_shift);
     for (const auto& sb : info.storage_buffers_descriptors) {
         if (sb.cbuf_index != d.cbuf_index) continue;
-        for (uint32_t j = 0; j < sb.count; j++) {
-            const uint32_t a = sb.cbuf_offset + j * 16;
-            if (at >= a && at < a + 8) return true;
+        if (at >= sb.cbuf_offset) {
+            const uint32_t rel = at - sb.cbuf_offset;
+            if ((rel >> 4) < sb.count && (rel & 15u) < 8u) return true;
         }
     }
     return false;
@@ -2694,9 +2695,8 @@ struct HandleHit {
 /// unordered_map (FNV over the key's bytes, a node a lookup), 5% of the replay thread outdoors. Linear probing, power of
 /// two, grown at half full; no erase (entries are overwritten, the whole table cleared)
 struct HandleTable {
-    struct Slot { uint64_t first; HandleHit second; };
+    struct Slot { uint64_t first; HandleHit second; uint8_t used; };
     std::vector<Slot> slots;
-    std::vector<uint8_t> used;
     size_t n = 0;
     struct Iter {
         Slot* s;
@@ -2710,33 +2710,31 @@ struct HandleTable {
         if (slots.empty()) return end();
         const size_t mask = slots.size() - 1;
         for (size_t i = mix(key) & mask;; i = (i + 1) & mask) {
-            if (!used[i]) return end();
+            if (!slots[i].used) return end();
             if (slots[i].first == key) return {&slots[i]};
         }
     }
     void grow() {
         std::vector<Slot> old = std::move(slots);
-        std::vector<uint8_t> old_used = std::move(used);
         const size_t cap = old.empty() ? 4096 : old.size() * 2;
         slots.assign(cap, Slot{});
-        used.assign(cap, 0);
         n = 0;
         for (size_t i = 0; i < old.size(); i++)
-            if (old_used[i]) (*this)[old[i].first] = old[i].second;
+            if (old[i].used) (*this)[old[i].first] = old[i].second;
     }
     HandleHit& operator[](uint64_t key) {
         if ((n + 1) * 2 > slots.size()) grow();
         const size_t mask = slots.size() - 1;
         for (size_t i = mix(key) & mask;; i = (i + 1) & mask) {
-            if (!used[i]) {
-                used[i] = 1, slots[i].first = key, slots[i].second = HandleHit{}, n++;
+            if (!slots[i].used) {
+                slots[i].used = 1, slots[i].first = key, slots[i].second = HandleHit{}, n++;
                 return slots[i].second;
             }
             if (slots[i].first == key) return slots[i].second;
         }
     }
     size_t size() const { return n; }
-    void clear() { std::fill(used.begin(), used.end(), 0), n = 0; }
+    void clear() { for (Slot& s : slots) s.used = 0; n = 0; }
 };
 TLS_OBJECT(handle_hits, HandleTable)
 // (relink) RX_VK_TRACE_TEX=<w>x<h>,...: each draw sampling a texture of that size is logged with its state, every 30th frame, 600 lines: a
@@ -2786,23 +2784,25 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
     const uint64_t key = (uint64_t)(handle & 0xFFFFF) | (uint64_t)want << 20 | (uint64_t)use << 28 | (uint64_t)storage_as << 32;
     static const bool log_hits = getenv("RX_VK_LOG_HITS") != nullptr;
     static int64_t st_hit, st_new, st_ver, st_gen, st_n;
-    const auto it = handle_hits().find(key);
+    HandleTable& hits = handle_hits();
+    const auto it = hits.find(key);
     if (log_hits) {   // (the counters were a second search of this map on every binding, with the log off)
         if (++st_n % 200000 == 0)
             logf("vk: handle hits %lld, new %lld, slot re-registered %lld, a texture destroyed %lld", (long long)st_hit,
                  (long long)st_new, (long long)st_ver, (long long)st_gen);
-        if (it == handle_hits().end()) st_new++;
+        if (it == hits.end()) st_new++;
         else if (it->second.version != version) st_ver++;
         else if (it->second.destroy_gen != dgen) st_gen++;
         else st_hit++;
     }
-    if (it != handle_hits().end() && it->second.version == version && it->second.destroy_gen == dgen) {
-        if (it->second.tex && it->second.tex_epoch != texture_epoch()) {   // (once a submission: its age and contents)
+    if (it != hits.end() && it->second.version == version && it->second.destroy_gen == dgen) {
+        const uint64_t epoch = texture_epoch();
+        if (it->second.tex && it->second.tex_epoch != epoch) {   // (once a submission: its age and contents)
             if (!texture_touch_quick(it->second.tex, it->second.sampling)) {
                 ParLock lk;
                 texture_touch(it->second.tex, it->second.sampling);
             }
-            it->second.tex_epoch = texture_epoch();
+            it->second.tex_epoch = epoch;
         }
         if (tex_out) *tex_out = it->second.tex;
         if (level_out) *level_out = it->second.level;
@@ -2834,7 +2834,7 @@ VkImageView texture_view_of(uint32_t handle, VkImageViewType want, ViewUse use, 
                      has_view && v.set_format ? v.format : 0, has_view && v.set_target ? v.target : -1, (int)want, (int)use);
         }
     }
-    handle_hits()[key] = {view, tex, level, version, dgen, use == ViewUse::Sample || use == ViewUse::Storage, texture_epoch()};
+    hits[key] = {view, tex, level, version, dgen, use == ViewUse::Sample || use == ViewUse::Storage, texture_epoch()};
     if (tex_out) *tex_out = tex;
     if (level_out) *level_out = level;
     return view;
@@ -3265,6 +3265,11 @@ bool null_tex_wanted(const Stage& st, const Shader::TextureDescriptor& d) {
 void build_descriptors(const NvnState& s, const Program& p) {
     DescWriter& wr = dw();
     auto& sampled = draw_sampled();
+    const bool slow_desc = slow_desc_timing();
+    const bool dumping = dump_on();
+    const bool log_img = log_img_wanted(p.key);
+    const uint64_t watch = watch_prog();
+    const bool watching = watch && p.key == watch;
     if (peek_prog(p.key)) peek_binds.clear();
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (relink: bound again below)
     if (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) meter_out = {};
@@ -3300,9 +3305,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, d.count);
             const size_t first = wr.bufs.size();
             for (uint32_t k = 0; k < d.count; k++) {
-                const auto t0 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto t0 = slow_desc ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 wr.bufs.push_back(uniform_range(s, st, d.index + k));
-                if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, wr.bufs.back().range);
+                if (slow_desc) slow_descriptor(t0, "uniform buffer", d.index + k, wr.bufs.back().range);
             }
             w.pBufferInfo = &wr.bufs[first];
             wr.writes.push_back(w);
@@ -3376,7 +3381,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     if (wide && d.count == 1 && addr)
                         if (const uint64_t end = gpu_pool_end(base); end > base + n) wide_n = std::min(end - base, wide) & ~3ull;
                 }
-                const auto t0 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                const auto t0 = slow_desc ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 // (relink) a storage buffer table's entries (count > 1, Info::global_tables): the ones past the table's
                 // end are whatever the constant buffer holds there, bound only when they look like a buffer
                 const bool plausible = d.count == 1 || (size && size <= (256ull << 20) && host->gpu_guest(base));
@@ -3491,14 +3496,14 @@ void build_descriptors(const NvnState& s, const Program& p) {
                         }
                     }
                 }
-                if (watch_prog() && p.key == watch_prog()) {   // (RX_VK_WATCH_PROG=<key>: that program's bindings)
+                if (watching) {   // (RX_VK_WATCH_PROG=<key>: that program's bindings)
                         watch_note("vk: watch %016llx: ssbo %u (c%u+%#x%s) addr %#llx size %#llx -> buffer %p offset %#llx range %#llx; grid %u %u %u",
                              (unsigned long long)p.key, k, (unsigned)d.cbuf_index, off, d.is_written ? ", written" : "",
                              (unsigned long long)addr, (unsigned long long)size, (void*)b.buffer,
                              (unsigned long long)b.offset, (unsigned long long)n, s.grid[0], s.grid[1], s.grid[2]);
                 }
-                if (slow_desc_timing()) slow_descriptor(t0, d.is_written ? "storage buffer (written)" : "storage buffer", base, n);
-                if (dump_on() && dump_ssbo_wanted(p.key)) {   // (RX_VK_DUMP_SSBO: where it is, and what the CPU's memory holds)
+                if (slow_desc) slow_descriptor(t0, d.is_written ? "storage buffer (written)" : "storage buffer", base, n);
+                if (dumping && dump_ssbo_wanted(p.key)) {   // (RX_VK_DUMP_SSBO: where it is, and what the CPU's memory holds)
                     std::vector<uint32_t> words((size_t)std::min<uint64_t>(n, 65536) / 4);
                     size_t nz = 0;
                     const bool read = b && addr && !words.empty() && host->gpu_read(base, words.data(), words.size() * 4);
@@ -3549,10 +3554,10 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     }
                 }
                 if (b && d.is_written) {
-                    const auto t1 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const auto t1 = slow_desc ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const uint64_t guest = host->gpu_guest(base);
                     if (guest) { ParLock lk; memory_stamp_gpu(guest, n); }
-                    if (slow_desc_timing()) slow_descriptor(t1, "stamp", base, n);
+                    if (slow_desc) slow_descriptor(t1, "stamp", base, n);
                 }
             }
             w.pBufferInfo = &wr.bufs[first];
@@ -3648,9 +3653,9 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     if (is_table) last_handle = handle, last_view = view, last_tex = tex;
                 }
                 if (view && null_tex_wanted(st, d)) view = VK_NULL_HANDLE, tex = nullptr;   // (RX_VK_NULL_TEX)
-                if (dump_on()) dump_input('t', (uint32_t)(wr.imgs.size() - 0), handle, view ? tex : nullptr);
+                if (dumping) dump_input('t', (uint32_t)(wr.imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
-                if (log_img_wanted(p.key)) {
+                if (log_img) {
                     static std::atomic<int> told{0};
                     if (told++ < 40)
                         logf("vk: img prog %016llx texture %u: handle %#x, shader integer %d type %d depth %d, view format "
@@ -3669,7 +3674,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              (unsigned long long)texture_frame_no(), (unsigned long long)p.key, tex->id, tex->width, tex->height,
                              tex->depth, (int)tex->format, (int)d.type, view ? "" : " DUMMY");
                 }
-                if (log_img_wanted(p.key) && log_img_new()) {
+                if (log_img && log_img_new()) {
                     // (RX_VK_LOG_IMG_NEW=1 with RX_VK_LOG_IMG: every new pairing of a program's texture slot with what it got,
                     // at its first frame, for the whole run: what a program samples in one scene and not in another)
                     const uint64_t sig = mix(mix(p.key, (uint64_t)k << 32 | (uint32_t)d.type),
@@ -3694,14 +3699,14 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              (unsigned)sp.cmp_func, (double)sp.lod_min, (double)sp.lod_max, (double)sp.lod_bias,
                              (double)sp.border[0], (double)sp.border[1], (double)sp.border[2], (double)sp.border[3]);
                 }
-                if (dump_on() && view && tex && dump_sampled_wanted(p.key)) {
+                if (dumping && view && tex && dump_sampled_wanted(p.key)) {
                     static std::unordered_set<uint32_t> done;
                     static int last_seq = 0;
                     if (dump_seq() < last_seq) done.clear();
                     last_seq = dump_seq();
                     if (done.size() < 96 && done.insert(tex->id).second) dump_sampled().push_back(tex);
                 }
-                if (watch_prog() && p.key == watch_prog())
+                if (watching)
                     watch_note("vk: watch %016llx: texture %u handle %#x -> #%u %#llx %ux%ux%u image %p view %p%s",
                                (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
@@ -3735,7 +3740,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              d.is_written ? "STORES" : "loads", tex->id, tex->width, tex->height, tex->depth, (int)tex->format,
                              (int)image_format(d.format), view ? "" : " NO VIEW");
                 }
-                if (log_img_wanted(p.key)) {
+                if (log_img) {
                     static std::atomic<int> told{0};
                     if (told++ < 16)
                         logf("vk: img prog %016llx image %u: handle %#x, shader integer %d format %d (view as %d), "
@@ -3750,8 +3755,8 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              (unsigned long long)p.key, (unsigned long long)tex->gpu, handle, (int)image_format(d.format),
                              view ? "view made" : "NO view");
                 }
-                if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written().push_back({tex, level});
-                if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)wr.imgs.size(), handle, view ? tex : nullptr);
+                if (view && tex && d.is_written && (dumping || probe_on())) dump_written().push_back({tex, level});
+                if (dumping) dump_input(d.is_written ? 'W' : 'R', (uint32_t)wr.imgs.size(), handle, view ? tex : nullptr);
                 if (!view && !dev.null_descriptor) view = dummies.view[(int)vt];   // (relink: make_dummies; null where it could not be made)
                 wr.imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
@@ -3825,20 +3830,25 @@ int words_same_store(const VkWriteDescriptorSet& w, uint64_t* o, const uint64_t*
     if ((size_t)(end - o) != 1 + (size_t)w.descriptorCount * per) return -1;
     bool same = true;
     auto put = [&](uint64_t v) {
-        same &= *o == v;
-        *o++ = v;
+        if (*o != v) {
+            *o = v;
+            same = false;
+        }
+        o++;
     };
     put((uint64_t)w.descriptorType << 32 | w.dstBinding);
-    for (uint32_t k = 0; k < w.descriptorCount; k++) {
-        if (w.pBufferInfo) {
+    if (w.pBufferInfo) {
+        for (uint32_t k = 0; k < w.descriptorCount; k++) {
             const VkDescriptorBufferInfo& b = w.pBufferInfo[k];
             put((uint64_t)b.buffer), put(b.offset), put(b.range);
-        } else if (w.pImageInfo) {
+        }
+    } else if (w.pImageInfo) {
+        for (uint32_t k = 0; k < w.descriptorCount; k++) {
             const VkDescriptorImageInfo& i = w.pImageInfo[k];
             put((uint64_t)i.sampler), put((uint64_t)i.imageView);
-        } else if (w.pTexelBufferView) {
-            put((uint64_t)w.pTexelBufferView[k]);
         }
+    } else if (w.pTexelBufferView) {
+        for (uint32_t k = 0; k < w.descriptorCount; k++) put((uint64_t)w.pTexelBufferView[k]);
     }
     return same ? 1 : 0;
 }

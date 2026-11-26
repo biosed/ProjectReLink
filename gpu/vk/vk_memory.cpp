@@ -767,6 +767,8 @@ void memory_sync() {
 // texture's clean regions without looking at their pages. 0: never written.
 namespace {
 constexpr uint64_t kPageShift = 12, kChunkPages = 1u << 16, kRegionPages = 512;
+static_assert(kChunkPages % kRegionPages == 0);
+constexpr uint64_t kRegionsPerChunk = kChunkPages / kRegionPages;
 constexpr uint64_t kPages = 1ull << 27;
 std::vector<std::unique_ptr<uint32_t[]>> gen_chunks(kPages / kChunkPages);
 std::vector<uint32_t> region_gen(kPages / kRegionPages);
@@ -850,9 +852,11 @@ bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen) {
     for (uint64_t r = p0 / kRegionPages; r <= p1 / kRegionPages; r++) {
         if (region_gen[r] <= gen) continue;
         if (load_u32(region_full[r]) > gen) return true;
+        uint32_t* const chunk = gen_chunks[r / kRegionsPerChunk].get();
+        if (!chunk) continue;
         const uint64_t a = std::max(p0, r * kRegionPages), b = std::min(p1, r * kRegionPages + kRegionPages - 1);
         for (uint64_t p = a; p <= b; p++)
-            if (page_gen(p) > gen) return true;
+            if (load_u32(chunk[p & (kChunkPages - 1)]) > gen) return true;
     }
     return false;
 }
@@ -862,8 +866,17 @@ void memory_written_runs(uint64_t guest, uint64_t size, uint32_t gen, std::vecto
     for (uint64_t r = p0 / kRegionPages; r <= p1 / kRegionPages; r++) {
         if (region_gen[r] <= gen) continue;
         const uint64_t a = std::max(p0, r * kRegionPages), b = std::min(p1, r * kRegionPages + kRegionPages - 1);
+        if (load_u32(region_full[r]) > gen) {
+            const uint64_t lo = std::max(a << kPageShift, guest) - guest;
+            const uint64_t hi = std::min((b + 1) << kPageShift, guest + size) - guest;
+            if (!out.empty() && out.back().second == lo) out.back().second = hi;
+            else out.push_back({lo, hi});
+            continue;
+        }
+        uint32_t* const chunk = gen_chunks[r / kRegionsPerChunk].get();
+        if (!chunk) continue;
         for (uint64_t p = a; p <= b; p++) {
-            if (page_gen(p) <= gen) continue;
+            if (load_u32(chunk[p & (kChunkPages - 1)]) <= gen) continue;
             const uint64_t lo = std::max(p << kPageShift, guest) - guest;
             const uint64_t hi = std::min((p + 1) << kPageShift, guest + size) - guest;
             if (!out.empty() && out.back().second == lo) out.back().second = hi;

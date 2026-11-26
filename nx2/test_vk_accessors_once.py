@@ -46,6 +46,10 @@ def main() -> None:
         assert body.count("Pass& ps = pass();") == 1, signature
         assert body.count("pass()") == 1, signature
 
+    view_of = function(source, "VkImageView texture_view_of(")
+    assert view_of.count("HandleTable& hits = handle_hits();") == 1
+    assert view_of.count("handle_hits()") == 1
+
     print("vk_accessors_once: ok")
 
 

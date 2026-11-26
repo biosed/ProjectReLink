@@ -47,6 +47,13 @@ def main() -> None:
 
     assert "__builtin_expect(g_fine, 0)" in vk_draw
     assert "std::memcmp(raw, craw, (size_t)nb)" in vk_draw
+    assert "std::memcmp(formats, cformats, 8 * sizeof(uint32_t))" in vk_draw
+    assert "(rel >> 4) < sb.count && (rel & 15u) < 8u" in vk_draw
+    assert "struct Slot { uint64_t first; HandleHit second; uint8_t used; };" in vk_draw
+    assert "if (w.pBufferInfo) {\n        for (uint32_t k = 0; k < w.descriptorCount; k++)" in vk_draw
+
+    vk_memory = (ROOT / "gpu" / "vk" / "vk_memory.cpp").read_text(encoding="utf-8")
+    assert "constexpr uint64_t kRegionsPerChunk = kChunkPages / kRegionPages;" in vk_memory
 
     print("vk_bc250_maxout: ok")
 
