@@ -26,6 +26,11 @@ def function(source: str, signature: str) -> str:
 def main() -> None:
     source = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
 
+    build = function(source, "void build_descriptors(")
+    assert build.count("DescWriter& wr = dw();") == 1
+    assert build.count("dw()") == 1
+    assert build.count("draw_sampled()") == 1
+
     bind = function(source, "bool bind_descriptors(")
     assert bind.count("DescWriter& wr = dw();") == 1
     assert bind.count("dw()") == 1

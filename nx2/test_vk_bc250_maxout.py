@@ -45,6 +45,9 @@ def main() -> None:
     vk_jobs = (ROOT / "gpu" / "vk" / "vk_jobs.cpp").read_text(encoding="utf-8")
     assert 'getenv("RX_VK_WORKERS")' in vk_jobs
 
+    assert "__builtin_expect(g_fine, 0)" in vk_draw
+    assert "std::memcmp(raw, craw, (size_t)nb)" in vk_draw
+
     print("vk_bc250_maxout: ok")
 
 

@@ -154,17 +154,17 @@ int64_t fine_ns[FT_COUNT], fine_n[FC_COUNT];
 struct FineScope {
     int ph;
     int64_t t0;
-    explicit FineScope(int p) : ph(p), t0(g_fine ? prof_now() : 0) {}
+    explicit FineScope(int p) : ph(p), t0(__builtin_expect(g_fine, 0) ? prof_now() : 0) {}
     void finish() {
-        if (g_fine && t0) fine_ns[ph] += prof_now() - t0, t0 = 0;
+        if (__builtin_expect(g_fine, 0) && t0) fine_ns[ph] += prof_now() - t0, t0 = 0;
     }
     ~FineScope() { finish(); }
     FineScope(const FineScope&) = delete;
     FineScope& operator=(const FineScope&) = delete;
 };
 #define FINE_SCOPE(ph) FineScope fine_scope_##ph(ph)
-#define FINE_N(c, n) do { if (g_fine) fine_n[c] += (n); } while (0)
-#define FINE_X(c, n) (g_fine ? (void)(fine_n[c] += (n)) : (void)0)   // (the same, as an expression)
+#define FINE_N(c, n) do { if (__builtin_expect(g_fine, 0)) fine_n[c] += (n); } while (0)
+#define FINE_X(c, n) (__builtin_expect(g_fine, 0) ? (void)(fine_n[c] += (n)) : (void)0)   // (the same, as an expression)
 /// The sums since the last report, as a frame's times and a draw's counts (the caller: every 120 frames)
 void fine_report(double frames) {
     if (!g_fine) return;
@@ -3263,11 +3263,13 @@ bool null_tex_wanted(const Stage& st, const Shader::TextureDescriptor& d) {
     }
 }
 void build_descriptors(const NvnState& s, const Program& p) {
+    DescWriter& wr = dw();
+    auto& sampled = draw_sampled();
     if (peek_prog(p.key)) peek_binds.clear();
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (relink: bound again below)
     if (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) meter_out = {};
-    dw().reset();
-    draw_sampled().clear();
+    wr.reset();
+    sampled.clear();
     light_probe_now = LightProbe{};
     dump_written().clear();
     dump_inputs().clear();
@@ -3280,7 +3282,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
         for (const auto& d : st.info.texture_descriptors) nimg += d.count;
         for (const auto& d : st.info.image_descriptors) nimg += d.count;
     }
-    dw().bufs.reserve(nbuf), dw().imgs.reserve(nimg), dw().views.reserve(nview);   // (stable pointers below)
+    wr.bufs.reserve(nbuf), wr.imgs.reserve(nimg), wr.views.reserve(nview);   // (stable pointers below)
     FINE_N(FC_DESCS, (int64_t)(nbuf + nimg + nview));
     uint32_t binding = 0;
     auto write = [&](VkDescriptorType type, uint32_t count) {
@@ -3296,24 +3298,24 @@ void build_descriptors(const NvnState& s, const Program& p) {
         const int ns = st.nvn_stage;
         for (const auto& d : info.constant_buffer_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, d.count);
-            const size_t first = dw().bufs.size();
+            const size_t first = wr.bufs.size();
             for (uint32_t k = 0; k < d.count; k++) {
                 const auto t0 = slow_desc_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                dw().bufs.push_back(uniform_range(s, st, d.index + k));
-                if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, dw().bufs.back().range);
+                wr.bufs.push_back(uniform_range(s, st, d.index + k));
+                if (slow_desc_timing()) slow_descriptor(t0, "uniform buffer", d.index + k, wr.bufs.back().range);
             }
-            w.pBufferInfo = &dw().bufs[first];
-            dw().writes.push_back(w);
+            w.pBufferInfo = &wr.bufs[first];
+            wr.writes.push_back(w);
         }
         for (const auto& d : info.storage_buffers_descriptors) {
             FINE_SCOPE(FT_STORAGE);
             FINE_N(FC_SSBO_DESCS, d.count);
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, d.count);
-            const size_t first = dw().bufs.size();
+            const size_t first = wr.bufs.size();
             for (uint32_t k = 0; k < d.count; k++) {
                 const uint32_t off = d.cbuf_offset + k * 16;
                 if (d.count == 1 && d.cbuf_index == 0 && d.cbuf_offset == 0xff0) {   // (EvilOOT, RX_VK_MISS_LOG)
-                    dw().bufs.push_back(miss_binding(p.key));
+                    wr.bufs.push_back(miss_binding(p.key));
                     continue;
                 }
                 // (AyyBeeDee20738, PR 138; EvilOOT the same before it, for OoT's culling tables in c4) through the stage's banks as
@@ -3532,7 +3534,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              (unsigned long long)addr, (unsigned long long)size, d.is_written ? " (written)" : "");
                 }
                 if (b && peek_prog(p.key)) peek_binds.push_back({b.buffer, b.offset, n, (uint32_t)ns, d.cbuf_index, off, ~0U, addr, base});
-                dw().bufs.push_back(b ? VkDescriptorBufferInfo{b.buffer, b.offset, n}
+                wr.bufs.push_back(b ? VkDescriptorBufferInfo{b.buffer, b.offset, n}
                                     : VkDescriptorBufferInfo{dev.null_descriptor ? VK_NULL_HANDLE : zero_buffer, 0,
                                                              dev.null_descriptor ? VK_WHOLE_SIZE : 16});
                 {   // (RX_VK_LOG_WRITTEN=1: every storage buffer range a program writes, once, 300 of them)
@@ -3553,13 +3555,13 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     if (slow_desc_timing()) slow_descriptor(t1, "stamp", base, n);
                 }
             }
-            w.pBufferInfo = &dw().bufs[first];
-            dw().writes.push_back(w);
+            w.pBufferInfo = &wr.bufs[first];
+            wr.writes.push_back(w);
         }
         auto texel_views = [&](const auto& list, VkDescriptorType type, bool storage) {
             for (const auto& d : list) {
                 VkWriteDescriptorSet w = write(type, d.count);
-                const size_t first = dw().views.size();
+                const size_t first = wr.views.size();
                 for (uint32_t k = 0; k < d.count; k++) {
                     const uint32_t handle = handle_of(s, st, d, k);
                     nvn_tex t;
@@ -3570,10 +3572,10 @@ void build_descriptors(const NvnState& s, const Program& p) {
                         ParLock lk;
                         bv = texel_buffer_view(&t, has_view ? &v : nullptr, storage);
                     }
-                    dw().views.push_back(bv);
+                    wr.views.push_back(bv);
                 }
-                w.pTexelBufferView = &dw().views[first];
-                dw().writes.push_back(w);
+                w.pTexelBufferView = &wr.views[first];
+                wr.writes.push_back(w);
             }
         };
         texel_views(info.texture_buffer_descriptors, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, false);
@@ -3581,7 +3583,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
         for (const auto& d : info.texture_descriptors) {
             FINE_SCOPE(FT_TEX);
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, d.count);
-            const size_t first = dw().imgs.size();
+            const size_t first = wr.imgs.size();
             const VkImageViewType vt = view_type(d.type);
             // (relink) A lookup table (texture_pass.cpp, kLookupSlots): slot k is the table's entry k (light k's shadow map), the
             // shader picking its slot per pixel. All slots evaluated at once; the unused entries repeat, so a slot naming the same
@@ -3646,7 +3648,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                     if (is_table) last_handle = handle, last_view = view, last_tex = tex;
                 }
                 if (view && null_tex_wanted(st, d)) view = VK_NULL_HANDLE, tex = nullptr;   // (RX_VK_NULL_TEX)
-                if (dump_on()) dump_input('t', (uint32_t)(dw().imgs.size() - 0), handle, view ? tex : nullptr);
+                if (dump_on()) dump_input('t', (uint32_t)(wr.imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
                 if (log_img_wanted(p.key)) {
                     static std::atomic<int> told{0};
@@ -3704,16 +3706,16 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
-                if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
+                if (view && tex && tex->gpu_written) sampled.push_back(tex);
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
-                dw().imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
+                wr.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth), view, VK_IMAGE_LAYOUT_GENERAL});
             }
-            w.pImageInfo = &dw().imgs[first];
-            dw().writes.push_back(w);
+            w.pImageInfo = &wr.imgs[first];
+            wr.writes.push_back(w);
         }
         for (const auto& d : info.image_descriptors) {
             VkWriteDescriptorSet w = write(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, d.count);
-            const size_t first = dw().imgs.size();
+            const size_t first = wr.imgs.size();
             const VkImageViewType vt = view_type(d.type);
             for (uint32_t k = 0; k < d.count; k++) {
                 const uint32_t handle = handle_of(s, st, d, k);
@@ -3722,7 +3724,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Storage, image_format(d.format), &tex, &level)
                                           : VK_NULL_HANDLE;
                 if (view && tex && d.is_written) { ParLock lk; texture_written(tex); }
-                if (view && tex) draw_sampled().push_back(tex);
+                if (view && tex) sampled.push_back(tex);
                 static const bool log_3d_w = getenv("RX_VK_LOG_3D") != nullptr;   // (relink, diagnosis: who stores into 3D)
                 if (log_3d_w && tex && tex->type == VK_IMAGE_TYPE_3D) {
                     ParLock lk;
@@ -3749,12 +3751,12 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              view ? "view made" : "NO view");
                 }
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written().push_back({tex, level});
-                if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw().imgs.size(), handle, view ? tex : nullptr);
+                if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)wr.imgs.size(), handle, view ? tex : nullptr);
                 if (!view && !dev.null_descriptor) view = dummies.view[(int)vt];   // (relink: make_dummies; null where it could not be made)
-                dw().imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
+                wr.imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
-            w.pImageInfo = &dw().imgs[first];
-            dw().writes.push_back(w);
+            w.pImageInfo = &wr.imgs[first];
+            wr.writes.push_back(w);
         }
     }
 }
@@ -4575,10 +4577,8 @@ bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t
     if (nf <= 0 || nu <= 0 || nb <= 0) return false;
     for (int i = 0; i < nf; i++)
         if (fp[i] != cfp[i]) return false;
-    for (int i = 0; i < nu; i++)
-        if (up[i] != cup[i]) return false;
-    for (int i = 0; i < nb; i++)
-        if (raw[i] != craw[i]) return false;
+    if (std::memcmp(up, cup, (size_t)nu * sizeof(uint32_t)) != 0) return false;
+    if (std::memcmp(raw, craw, (size_t)nb) != 0) return false;
     return true;
 }
 constexpr int kDynF = 13, kDynU = 35;
