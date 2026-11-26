@@ -79,7 +79,9 @@ void worker() {
 void start() {
     // (relink: half the hardware threads, 2 to 6, and background work (compute pipelines made ahead) on half of them at most: with
     // four workers all in multi-second compute compiles, a pipeline a draw waited on had no worker for seconds)
-    const unsigned n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+    const char* env_n = getenv("RX_VK_WORKERS");
+    const unsigned def_n = std::clamp(std::thread::hardware_concurrency() / 2, 2u, 6u);
+    const unsigned n = (env_n && *env_n) ? (unsigned)std::clamp(atoi(env_n), 1, 16) : def_n;
     workers_n = n;
     for (unsigned i = 0; i < n; i++) std::thread(worker).detach();
     started = true;

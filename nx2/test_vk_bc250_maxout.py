@@ -42,6 +42,9 @@ def main() -> None:
     assert "if (v == UINT64_MAX || v > rec_sent_pub.load(std::memory_order_acquire))" in vk_replay
     assert "void note_rec_sent(uint64_t seq)" in vk_replay
 
+    vk_jobs = (ROOT / "gpu" / "vk" / "vk_jobs.cpp").read_text(encoding="utf-8")
+    assert 'getenv("RX_VK_WORKERS")' in vk_jobs
+
     print("vk_bc250_maxout: ok")
 
 
